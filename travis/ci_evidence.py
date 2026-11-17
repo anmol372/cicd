@@ -267,17 +267,19 @@ def generated_log(args, directory):
 
 def prepare_images(args):
     metadata = Path(args.metadata)
+    rows = [json.loads(line) for line in metadata.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not rows:
+        raise EvidenceError("metadata contains no images")
+    images = [valid_name(row["image"], "image name") for row in rows]
+    if len(set(images)) != len(images):
+        raise EvidenceError("duplicate image metadata")
+    if args.expected_images is not None:
+        expected = [valid_name(name, "expected image") for name in args.expected_images.split(",")]
+        if len(set(expected)) != len(expected) or set(images) != set(expected):
+            raise EvidenceError("metadata differs from expected image cohort")
     builder = Builder(args, "images", args.release_tag + ".z", "z")
-    seen = set()
     try:
-        rows = [json.loads(line) for line in metadata.read_text(encoding="utf-8").splitlines() if line.strip()]
-        if not rows:
-            raise EvidenceError("metadata contains no images")
-        for row in rows:
-            image = valid_name(row["image"], "image name")
-            if image in seen:
-                raise EvidenceError("duplicate image metadata")
-            seen.add(image)
+        for row, image in zip(rows, images):
             registry = row["registry"]
             if not re.fullmatch(r"[A-Za-z0-9.-]+(?::[0-9]+)?/[A-Za-z0-9_./-]+", registry):
                 raise EvidenceError("invalid image registry")
@@ -954,6 +956,7 @@ def parser():
             child.add_argument("--" + flag, default=os.environ.get(env), required=not bool(os.environ.get(env)))
         if command == "prepare-images":
             child.add_argument("--metadata", required=True)
+            child.add_argument("--expected-images", help="require this exact cohort after a successful build")
             child.set_defaults(func=prepare_images)
         else:
             child.add_argument("--artifact", required=True)

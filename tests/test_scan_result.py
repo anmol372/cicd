@@ -192,7 +192,33 @@ class ScanCLI(unittest.TestCase):
         aliases = [index for index, item in enumerate(attempts) if item["phase"] == "push" and item["reference"].endswith(".z")]
         immutable = [index for index, item in enumerate(attempts) if item["phase"] == "verify-image-id" and not item["reference"].endswith(".z")]
         self.assertLess(max(immutable), min(aliases))
+        self.assertEqual([attempts[index]["reference"] for index in aliases], [
+            "quay.io/noiro/image-0:6.1.1.8.42.z",
+            "docker.io/noiro/image-0:6.1.1.8.42.z",
+            "quay.io/noirolabs/image-0:6.1.1.8.42.z",
+        ])
         self.assertTrue(all(item["image_id"] == receipt["image_id"] for item in receipt["references"]))
+
+    def test_replica_alias_push_or_verification_failure_does_not_advance_downstream_alias(self):
+        cases = ((registry, operation) for registry in ("quay.io/noiro", "docker.io/noiro")
+                 for operation in ("push", "verify"))
+        for index, (registry, operation) in enumerate(cases):
+            name = f"image-{index}"
+            reference = f"{registry}/{name}:6.1.1.8.42.z"
+            with self.subTest(registry=registry, operation=operation):
+                if operation == "verify":
+                    self.env["MISMATCH_IMAGE_ID_REF"] = reference
+                try:
+                    result, artifacts = self.push(name=name, failure=reference if operation == "push" else None)
+                finally:
+                    self.env.pop("MISMATCH_IMAGE_ID_REF", None)
+                self.assertNotEqual(result.returncode, 0)
+                receipt = json.loads((artifacts / f"publication/{name}.json").read_text())
+                self.assertEqual(receipt["state"], "partial")
+                self.assertEqual(receipt["critical_failure"], "image-publication-failed")
+                downstream = f"quay.io/noirolabs/{name}:6.1.1.8.42.z"
+                self.assertFalse(any(item["phase"] == "push" and item["reference"] == downstream
+                                     for item in receipt["attempts"]))
 
     def test_opflex_build_preserves_noirolabs_alias_without_other_registries(self):
         result, artifacts = self.push(name="opflex-build")

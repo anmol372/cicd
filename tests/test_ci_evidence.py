@@ -77,6 +77,30 @@ class EvidenceCLI(unittest.TestCase):
         self.cli("prepare-images", "--metadata", metadata, "--bundle", bundle, *self.common)
         return bundle
 
+    def test_expected_image_cohort_rejects_incomplete_duplicate_or_unexpected_metadata_before_tools(self):
+        metadata = self.images(count=2)
+        rows = [json.loads(line) for line in metadata.read_text().splitlines()]
+        variants = (rows[:1], [rows[0], rows[0], rows[1]],
+                    [rows[0], dict(rows[1], image="unexpected")])
+        for index, values in enumerate(variants):
+            with self.subTest(images=[row["image"] for row in values]):
+                candidate = metadata.with_name(f"invalid-{index}.jsonl")
+                candidate.write_text("\n".join(json.dumps(row) for row in values))
+                bundle = self.root / f"invalid-bundle-{index}"
+                result = self.cli("prepare-images", "--metadata", candidate, "--bundle", bundle,
+                                  "--expected-images", "image-0,image-1", *self.common, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(bundle.exists())
+                self.assertFalse((self.root / "tools.jsonl").exists())
+
+        self.cli("prepare-images", "--metadata", metadata, "--bundle", self.root / "complete",
+                 "--expected-images", "image-0,image-1", *self.common)
+        partial = metadata.with_name("partial.jsonl")
+        partial.write_text(json.dumps(rows[0]))
+        bundle = self.prepare(partial, "partial-bundle")
+        manifest = json.loads((bundle / "manifest.json").read_text())
+        self.assertEqual([row["name"] for row in manifest["records"]], ["image-0"])
+
     def remote(self):
         repo, checkout = self.root / "remote.git", self.root / "seed"
         self.git("init", "--bare", "--initial-branch=main", str(repo))
@@ -229,7 +253,17 @@ class EvidenceCLI(unittest.TestCase):
             self.assertEqual(row["scan"]["base"]["state"], "unavailable", "a postbuild argument is not base provenance")
             self.assertEqual(row["publication"]["state"], "complete")
         self.assertEqual(len({(artifacts / row["reports"]["sbom"]).read_text() for row in rows}), 8)
-        self.prepare(metadata)
+        elsewhere = self.root / "different-working-directory"
+        elsewhere.mkdir()
+        bundle = self.root / "bundle"
+        self.cli("prepare-images", "--metadata", metadata, "--bundle", bundle, *self.common, cwd=elsewhere)
+        manifest = json.loads((bundle / "manifest.json").read_text())
+        repo, checkout = self.remote()
+        self.publish(bundle, repo)
+        for record in manifest["records"]:
+            published = self.git("--git-dir", str(repo), "show", "main:docs/" + record["sbom"])
+            retained = (bundle / "artifacts/docs" / record["sbom"]).read_text().strip()
+            self.assertEqual(published, retained)
 
     def test_two_concurrent_writers_retry_fresh_clone_without_rescan(self):
         first = self.prepare(self.images(name="first"), "bundle-first")

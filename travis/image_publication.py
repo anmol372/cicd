@@ -132,9 +132,10 @@ def publish(args):
             push(f"quay.io/noiro/{args.image}:{tag}", "quay", args.quay_config)
             push(f"docker.io/noiro/{args.image}:{tag}", "docker")
         # No mutable alias is pushed until all immutable destinations verify.
-        push(f"quay.io/noirolabs/{args.image}:{args.z_tag}", "noirolabs")
         push(f"quay.io/noiro/{args.image}:{args.z_tag}", "quay", args.quay_config)
         push(f"docker.io/noiro/{args.image}:{args.z_tag}", "docker")
+        # Downstream builds observe noirolabs only after every replica verifies.
+        push(f"quay.io/noirolabs/{args.image}:{args.z_tag}", "noirolabs")
         receipt["state"] = "complete"
         return 0
     except (RuntimeError, ValueError, KeyError, TypeError, StopIteration):
