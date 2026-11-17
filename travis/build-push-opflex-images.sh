@@ -53,9 +53,13 @@ if [[ "${GITHUB_ACTIONS:-false}" == "true" ]]; then
       ;;
     runtime)
       BUILD_BASE=false
+      if [[ -z "${EXPECTED_OPFLEX_BASE_DIGEST:-}" ]]; then
+        echo "::error::EXPECTED_OPFLEX_BASE_DIGEST is required for runtime phase" >&2
+        exit 1
+      fi
       ;;
     *)
-      echo "GHA_OPFLEX_BUILD_PHASE must be base or runtime" >&2
+      echo "::error::GHA_OPFLEX_BUILD_PHASE must be base or runtime" >&2
       exit 1
       ;;
   esac
@@ -69,6 +73,14 @@ else
     OTHER_IMAGE_TAGS="${RELEASE_TAG_WITH_UPSTREAM_ID},${RELEASE_TAG_WITH_UPSTREAM_ID}.${DATE_TAG}.${TRAVIS_BUILD_NUMBER},${UPSTREAM_IMAGE_Z_TAG}"
   else
     BUILD_BASE=false
+  fi
+fi
+
+# The child selects its build phase and immutable runtime input from the environment.
+if [[ "${GITHUB_ACTIONS:-false}" == "true" ]]; then
+  export GHA_OPFLEX_BUILD_PHASE
+  if [[ "${BUILD_BASE}" == false ]]; then
+    export EXPECTED_OPFLEX_BASE_DIGEST
   fi
 fi
 
