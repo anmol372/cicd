@@ -212,6 +212,38 @@ class ScanCLI(unittest.TestCase):
         self.assertIn("/image-0/6.1.1.8-publication.json", paths)
         self.assertIn("/image-1/failures/123-1/6.1.1.8-publication.json", paths)
 
+    def test_in_progress_advisory_publication_does_not_replace_current_evidence(self):
+        result, artifacts = self.push()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        good = self.prepare(artifacts / "image-metadata.jsonl")
+        repo, checkout = self.remote()
+        self.publish(good, repo)
+        prior = self.git("--git-dir", str(repo), "show", "main:docs/release_artifacts/releases.yaml")
+        files = json.loads((good / "manifest.json").read_text())["files"]
+        blobs = {item["path"]: self.git("--git-dir", str(repo), "rev-parse", "main:" + item["path"])
+                 for item in files}
+        result, interrupted = self.push(mode="zero", artifacts=self.root / "interrupted")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        metadata = interrupted / "image-metadata.jsonl"
+        row = json.loads(metadata.read_text())
+        self.assertEqual(row["publication"]["state"], "complete")
+        row["publication"]["state"] = "in-progress"
+        metadata.write_text(json.dumps(row) + "\n")
+        self.common[self.common.index("--run-id") + 1] = "124"
+        bundle = self.prepare(metadata, "interrupted-bundle")
+        manifest = json.loads((bundle / "manifest.json").read_text())
+        self.assertFalse(manifest["records"])
+        self.assertFalse(manifest["images"])
+        record = manifest["failed_records"][0]
+        self.assertEqual(record["publication"]["state"], "in-progress")
+        self.assertIn("/failures/124-1/", record["cve"])
+        self.publish(bundle, repo)
+        self.assertEqual(prior, self.git("--git-dir", str(repo), "show", "main:docs/release_artifacts/releases.yaml"))
+        for path, blob in blobs.items():
+            self.assertEqual(blob, self.git("--git-dir", str(repo), "rev-parse", "main:" + path))
+        paths = self.git("--git-dir", str(repo), "ls-tree", "-r", "--name-only", "main")
+        self.assertIn("/failures/124-1/6.1.1.8-publication.json", paths)
+
     def test_unknown_prepared_scan_policy_is_rejected_before_tools(self):
         result, artifacts = self.push(policy="unexpected")
         self.assertNotEqual(result.returncode, 0)

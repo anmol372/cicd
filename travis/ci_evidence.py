@@ -308,7 +308,8 @@ def prepare_images(args):
             if "buildlog" not in paths:
                 paths["buildlog"] = generated_log(args, builder.temp)
             scan_policy = row.get("scan_policy", "fatal")
-            publication_failed = row.get("publication", {}).get("state") in ("failed", "partial")
+            publication = row.get("publication")
+            publication_failed = bool(publication) and publication.get("state") != "complete"
             prefix = f"release_artifacts/{args.release_tag}/z/{image}/"
             if publication_failed:
                 prefix += f"failures/{args.run_id}-{args.run_attempt}/"
