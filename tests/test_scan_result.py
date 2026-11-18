@@ -30,8 +30,8 @@ class ScanCLI(unittest.TestCase):
                       "--lock", str(lock or self.env["SCAN_TOOL_LOCK"]), "--timeout", timeout], env=env)
         return json.loads((output / "scan.json").read_text()), output
 
-    def push(self, *, mode="ok", failure=None, name="image-0", policy="advisory"):
-        artifacts = self.root / ("push-" + mode + ("-failure" if failure else "") + "-" + name)
+    def push(self, *, mode="ok", failure=None, name="image-0", policy="advisory", artifacts=None):
+        artifacts = artifacts or self.root / ("push-" + mode + ("-failure" if failure else "") + "-" + name)
         env = dict(self.env, GITHUB_ACTIONS="true", CI_EVIDENCE_MODE="prepared-v1", GHA_DATE_TAG="111226", TRAVIS_TAG="6.1.1.8",
                    UPSTREAM_ID="42", TRAVIS_BUILD_NUMBER="123", CI_ARTIFACT_DIR=str(artifacts),
                    SCAN_FIXTURE_MODE=mode, QUAY_NOIRO_DOCKER_CONFIG=str(self.root / "quay"))
@@ -157,6 +157,61 @@ class ScanCLI(unittest.TestCase):
         paths = self.git("--git-dir", str(repo), "ls-tree", "-r", "--name-only", "main")
         self.assertIn("/failures/124-1/6.1.1.8-publication.json", paths)
 
+    def test_advisory_publication_failures_retain_good_current_record_and_report_bytes(self):
+        result, artifacts = self.push()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        good = self.prepare(artifacts / "image-metadata.jsonl")
+        repo, checkout = self.remote()
+        self.publish(good, repo)
+        prior = self.git("--git-dir", str(repo), "show", "main:docs/release_artifacts/releases.yaml")
+        files = json.loads((good / "manifest.json").read_text())["files"]
+        blobs = {item["path"]: self.git("--git-dir", str(repo), "rev-parse", "main:" + item["path"])
+                 for item in files}
+        failures = (("failed", "quay.io/noirolabs/image-0:6.1.1.8.42"),
+                    ("partial", "docker.io/noiro/image-0:6.1.1.8.42.111226.123"))
+        for index, (state, reference) in enumerate(failures):
+            with self.subTest(publication=state):
+                run_id = str(124 + index)
+                self.common[self.common.index("--run-id") + 1] = run_id
+                result, artifacts = self.push(failure=reference, artifacts=self.root / state)
+                self.assertNotEqual(result.returncode, 0)
+                bundle = self.prepare(artifacts / "image-metadata.jsonl", state + "-bundle")
+                manifest = json.loads((bundle / "manifest.json").read_text())
+                self.assertFalse(manifest["records"])
+                self.assertFalse(manifest["images"])
+                record = manifest["failed_records"][0]
+                self.assertEqual(record["publication"]["state"], state)
+                for kind in ("sbom", "cve", "build-logs"):
+                    self.assertIn(f"/failures/{run_id}-1/", record[kind])
+                self.publish(bundle, repo)
+                self.assertEqual(prior, self.git("--git-dir", str(repo), "show", "main:docs/release_artifacts/releases.yaml"))
+                for path, blob in blobs.items():
+                    self.assertEqual(blob, self.git("--git-dir", str(repo), "rev-parse", "main:" + path))
+                paths = self.git("--git-dir", str(repo), "ls-tree", "-r", "--name-only", "main")
+                self.assertIn(f"/failures/{run_id}-1/6.1.1.8-publication.json", paths)
+
+    def test_unresolved_failed_image_keeps_completed_advisory_prefix_publishable(self):
+        result, artifacts = self.push()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.env["FAKE_IMAGE_ID"] = ""
+        try:
+            result, _ = self.push(name="image-1", artifacts=artifacts)
+        finally:
+            self.env.pop("FAKE_IMAGE_ID", None)
+        self.assertNotEqual(result.returncode, 0)
+        rows = [json.loads(line) for line in (artifacts / "image-metadata.jsonl").read_text().splitlines()]
+        self.assertIsNone(rows[-1]["sha"])
+        bundle = self.prepare(artifacts / "image-metadata.jsonl")
+        manifest = json.loads((bundle / "manifest.json").read_text())
+        self.assertEqual([row["name"] for row in manifest["records"]], ["image-0"])
+        self.assertEqual([row["name"] for row in manifest["images"]], ["image-0"])
+        self.assertEqual([row["name"] for row in manifest["failed_records"]], ["image-1"])
+        repo, checkout = self.remote()
+        self.publish(bundle, repo)
+        paths = self.git("--git-dir", str(repo), "ls-tree", "-r", "--name-only", "main")
+        self.assertIn("/image-0/6.1.1.8-publication.json", paths)
+        self.assertIn("/image-1/failures/123-1/6.1.1.8-publication.json", paths)
+
     def test_unknown_prepared_scan_policy_is_rejected_before_tools(self):
         result, artifacts = self.push(policy="unexpected")
         self.assertNotEqual(result.returncode, 0)
@@ -177,7 +232,8 @@ class ScanCLI(unittest.TestCase):
         self.assertFalse(any(reference.endswith(".z") for reference in pushes))
         bundle = self.prepare(artifacts / "image-metadata.jsonl")
         manifest = json.loads((bundle / "manifest.json").read_text())
-        record = manifest["records"][0]
+        self.assertFalse(manifest["records"])
+        record = manifest["failed_records"][0]
         self.assertEqual(record["publication"]["state"], "partial")
         self.assertFalse(record["docker"])
         self.assertTrue(record["quay"])

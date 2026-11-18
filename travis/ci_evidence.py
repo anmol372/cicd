@@ -308,9 +308,9 @@ def prepare_images(args):
             if "buildlog" not in paths:
                 paths["buildlog"] = generated_log(args, builder.temp)
             scan_policy = row.get("scan_policy", "fatal")
-            failed_default = scan_policy == "fatal" and row.get("publication", {}).get("state") in ("failed", "partial")
+            publication_failed = row.get("publication", {}).get("state") in ("failed", "partial")
             prefix = f"release_artifacts/{args.release_tag}/z/{image}/"
-            if failed_default:
+            if publication_failed:
                 prefix += f"failures/{args.run_id}-{args.run_attempt}/"
             prefix += args.release_tag
             grype = paths["cve"].read_text(encoding="utf-8")
@@ -396,7 +396,7 @@ def prepare_images(args):
                     raise EvidenceError("invalid bound build input proof")
                 if build_input not in builder.manifest.setdefault("build_inputs", []):
                     builder.manifest["build_inputs"].append(copy.deepcopy(build_input))
-            if failed_default:
+            if publication_failed:
                 builder.manifest["failed_records"].append(record)
                 builder.manifest["images"] = [item for item in builder.manifest["images"] if item["name"] != image]
             else:
