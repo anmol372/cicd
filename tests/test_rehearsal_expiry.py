@@ -40,6 +40,15 @@ class RehearsalExpiryTests(unittest.TestCase):
             self.assertEqual(rehearsal_quay.verify_expiry(REF, DIGEST, created=True), 31600)
         self.assertEqual(request.call_args_list[1].args[1], {"expiration": 31600})
 
+    def test_new_tag_with_label_expiry_needs_only_a_read(self):
+        row = {"name": REF.split(":")[1], "manifest_digest": DIGEST, "start_ts": 10000,
+               "end_ts": 31600, "expiration": "future"}
+        with patch.object(rehearsal_quay.time, "time", return_value=10001), \
+                patch.object(rehearsal_quay, "request", return_value={"tags": [row]}) as request:
+            self.assertEqual(rehearsal_quay.verify_expiry(REF, DIGEST, created=True), 31600)
+        request.assert_called_once()
+        self.assertEqual(len(request.call_args.args), 1)
+
     def test_expiry_of_existing_alias_is_verified_without_mutation(self):
         row = {"name": REF.split(":")[1], "manifest_digest": DIGEST, "start_ts": 10000,
                "end_ts": 11000, "expiration": "future"}

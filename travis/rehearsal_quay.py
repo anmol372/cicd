@@ -50,7 +50,7 @@ def request(path, data=None):
 def parts(reference):
     match = re.fullmatch(r"quay\.io/anmrasto/([a-z0-9-]+):([a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127})", reference)
     if not active() or not match:
-        raise ValueError("rehearsal writes must target a private test image tag")
+        raise ValueError("rehearsal writes must target a personal namespace test image tag")
     return "anmrasto/" + match[1], match[2]
 
 
@@ -66,7 +66,7 @@ def current_tag(reference):
 
 
 def verify_expiry(reference, digest, *, created):
-    """Apply expiry only to a tag this attempt pushed, then verify readback."""
+    """Verify the tag's expiry and set it if this attempt needs to."""
     repo, tag = parts(reference)
     for attempt in range(3):
         try:
@@ -78,7 +78,9 @@ def verify_expiry(reference, digest, *, created):
                 raise ValueError("invalid rehearsal tag start time")
             deadline = start + TTL_SECONDS
             expiry = row.get("end_ts")
-            if created:
+            # Quay can apply the image label atomically at push time.
+            if created and not (type(expiry) is int and time.time() < expiry <= deadline
+                                and row.get("expiration")):
                 desired = min(expiry, deadline) if type(expiry) is int else deadline
                 request(f"{repo}/tag/{quote(tag, safe='')}", {"expiration": desired})
                 row = current_tag(reference)
