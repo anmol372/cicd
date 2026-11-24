@@ -3,6 +3,9 @@ if [[ "${GITHUB_ACTIONS:-false}" != "true" ]]; then
   set -x
 fi
 RELEASE_TAG="6.1.2.1"
+if [[ "${CI_REHEARSAL:-}" == 1 ]]; then
+  source "$(dirname "${BASH_SOURCE[0]}")/rehearsal-images.sh" || return 1
+fi
 export RELEASE_TAG
 if [[ "${GITHUB_ACTIONS:-false}" == "true" && -n "${GHA_DATE_TAG:-}" ]]; then
   [[ "${GHA_DATE_TAG}" =~ ^[0-9]{6}$ ]] || {
@@ -29,4 +32,9 @@ QUAY_NOIRO_REGISTRY=quay.io/noiro
 DOCKER_REGISTRY=docker.io/noiro
 CICD_STATUS_REPO="https://github.com/noironetworks/cicd-status.git"
 CICD_STATUS_REPO_DIR="cicd-status"
+if [[ "${CI_REHEARSAL:-}" == 1 ]]; then
+  QUAY_REGISTRY=quay.io/anmrasto
+  QUAY_NOIRO_REGISTRY=$QUAY_REGISTRY
+  CICD_STATUS_REPO=https://github.com/noironetworks/test-cicd-status.git
+fi
 export CICD_STATUS_REPO_DIR

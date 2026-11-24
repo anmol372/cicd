@@ -5,7 +5,8 @@ else
   set -x
 fi
 SCRIPTS_DIR=$(dirname ${BASH_SOURCE[0]})
-source "$SCRIPTS_DIR/globals.sh"
+source "$SCRIPTS_DIR/globals.sh" || exit 1
+export -n CI_QUAY_USERNAME CI_QUAY_TOKEN
 
 git show --summary
 
@@ -15,23 +16,18 @@ OTHER_IMAGE_TAGS="${TRAVIS_TAG_WITH_UPSTREAM_ID},${TRAVIS_TAG_WITH_UPSTREAM_ID_D
 RELEASE_TAG_WITH_UPSTREAM_ID=${RELEASE_TAG}.${UPSTREAM_ID}
 
 if [[ "${GITHUB_ACTIONS:-false}" == "true" ]]; then
-  : "${GHA_TRIGGER_TAG:?GHA_TRIGGER_TAG is required for a GitHub Actions build}"
   : "${GHA_DATE_TAG:?GHA_DATE_TAG is required for a GitHub Actions build}"
   : "${TRAVIS_BUILD_NUMBER:?TRAVIS_BUILD_NUMBER is required for a GitHub Actions build}"
   : "${CI_ARTIFACT_DIR:?CI_ARTIFACT_DIR is required for a GitHub Actions build}"
-  # Validate the release form (prefix match) like Travis check-git-tag.sh, not an exact tag.
-  [[ "${GHA_TRIGGER_TAG}" == "${RELEASE_TAG}"* ]] || {
-    echo "GitHub Actions trigger tag ${GHA_TRIGGER_TAG} must match release ${RELEASE_TAG}" >&2
-    exit 1
-  }
-  [[ "${GITHUB_REPOSITORY:-}" == "noironetworks/aci-containers" ]] || {
-    echo "GitHub Actions build is restricted to noironetworks/aci-containers" >&2
-    exit 1
-  }
-  [[ "${GITHUB_REF:-}" == "refs/tags/${GHA_TRIGGER_TAG}" ]] || {
-    echo "GitHub Actions build is restricted to tag ${GHA_TRIGGER_TAG}" >&2
-    exit 1
-  }
+  if [[ "${CI_REHEARSAL:-}" == 1 ]]; then
+    [[ "${GITHUB_REPOSITORY}" == anmol372/aci-containers ]] || exit 1
+  else
+    [[ "${GITHUB_REPOSITORY:-}" == noironetworks/aci-containers &&
+       "${GHA_TRIGGER_TAG:-}" == "${RELEASE_TAG}" &&
+       "${GITHUB_REF:-}" == "refs/tags/${RELEASE_TAG}" ]] || {
+      echo "GitHub Actions build requires the release tag in noironetworks/aci-containers" >&2; exit 1;
+    }
+  fi
   [[ "${TRAVIS_TAG:-}" == "${RELEASE_TAG}" ]] || {
     echo "GitHub Actions must use release tag ${RELEASE_TAG} for image naming" >&2
     exit 1
@@ -87,25 +83,31 @@ fi
 
 make -C . all-static
 
-docker/travis/build-openvswitch-travis.sh ${IMAGE_BUILD_REGISTRY} ${IMAGE_TAG}
+BUILD_LABEL=
+BUILD_LABEL_ARGS=()
+if [[ "${CI_REHEARSAL:-}" == 1 ]]; then
+  BUILD_LABEL=--label=quay.expires-after=6h
+  BUILD_LABEL_ARGS+=("${BUILD_LABEL}")
+fi
+docker/travis/build-openvswitch-travis.sh "${IMAGE_BUILD_REGISTRY}" "${IMAGE_TAG}" "${BUILD_LABEL}"
 if [[ "${GITHUB_ACTIONS:-false}" == "true" ]]; then
   docker image rm "${IMAGE_BUILD_REGISTRY}/openvswitch-base:${IMAGE_TAG}" >/dev/null || true
   docker builder prune --force >/dev/null
 fi
 docker images
-docker build -t ${IMAGE_BUILD_REGISTRY}/cnideploy:${IMAGE_TAG} --file=docker/travis/Dockerfile-cnideploy .
+docker build ${BUILD_LABEL_ARGS[@]+"${BUILD_LABEL_ARGS[@]}"} -t "${IMAGE_BUILD_REGISTRY}/cnideploy:${IMAGE_TAG}" --file=docker/travis/Dockerfile-cnideploy .
 docker images
-docker build -t ${IMAGE_BUILD_REGISTRY}/aci-containers-controller:${IMAGE_TAG} --file=docker/travis/Dockerfile-controller .
+docker build ${BUILD_LABEL_ARGS[@]+"${BUILD_LABEL_ARGS[@]}"} -t "${IMAGE_BUILD_REGISTRY}/aci-containers-controller:${IMAGE_TAG}" --file=docker/travis/Dockerfile-controller .
 docker images
-docker build --target without-ovscni -t ${IMAGE_BUILD_REGISTRY}/aci-containers-host:${IMAGE_TAG} --file=docker/travis/Dockerfile-host .
+docker build ${BUILD_LABEL_ARGS[@]+"${BUILD_LABEL_ARGS[@]}"} --target without-ovscni -t "${IMAGE_BUILD_REGISTRY}/aci-containers-host:${IMAGE_TAG}" --file=docker/travis/Dockerfile-host .
 docker images
-docker build --target with-ovscni -t ${IMAGE_BUILD_REGISTRY}/aci-containers-host-ovscni:${IMAGE_TAG} --file=docker/travis/Dockerfile-host .
+docker build ${BUILD_LABEL_ARGS[@]+"${BUILD_LABEL_ARGS[@]}"} --target with-ovscni -t "${IMAGE_BUILD_REGISTRY}/aci-containers-host-ovscni:${IMAGE_TAG}" --file=docker/travis/Dockerfile-host .
 docker images
-docker build -t ${IMAGE_BUILD_REGISTRY}/aci-containers-operator:${IMAGE_TAG} --file=docker/travis/Dockerfile-operator .
+docker build ${BUILD_LABEL_ARGS[@]+"${BUILD_LABEL_ARGS[@]}"} -t "${IMAGE_BUILD_REGISTRY}/aci-containers-operator:${IMAGE_TAG}" --file=docker/travis/Dockerfile-operator .
 docker images
-docker build -t ${IMAGE_BUILD_REGISTRY}/aci-containers-webhook:${IMAGE_TAG} --file=docker/travis/Dockerfile-webhook .
+docker build ${BUILD_LABEL_ARGS[@]+"${BUILD_LABEL_ARGS[@]}"} -t "${IMAGE_BUILD_REGISTRY}/aci-containers-webhook:${IMAGE_TAG}" --file=docker/travis/Dockerfile-webhook .
 docker images
-docker build -t ${IMAGE_BUILD_REGISTRY}/aci-containers-certmanager:${IMAGE_TAG} --file=docker/travis/Dockerfile-certmanager .
+docker build ${BUILD_LABEL_ARGS[@]+"${BUILD_LABEL_ARGS[@]}"} -t "${IMAGE_BUILD_REGISTRY}/aci-containers-certmanager:${IMAGE_TAG}" --file=docker/travis/Dockerfile-certmanager .
 docker images
 
 # Fetching Base Image - Common base image for every ACI container so fetching once
@@ -134,7 +136,8 @@ for IMAGE in "${ALL_IMAGES[@]}"; do
     BASE_FOR_IMAGE="${OVS_BASE_IMAGE}"
   fi
 
-  $SCRIPTS_DIR/push-images.sh "${IMAGE_BUILD_REGISTRY}" "${IMAGE}" "${IMAGE_BUILD_TAG}" "${OTHER_IMAGE_TAGS}" "${BASE_FOR_IMAGE}"
+  CI_QUAY_USERNAME="${CI_QUAY_USERNAME:-}" CI_QUAY_TOKEN="${CI_QUAY_TOKEN:-}" \
+    "$SCRIPTS_DIR/push-images.sh" "${IMAGE_BUILD_REGISTRY}" "${IMAGE}" "${IMAGE_BUILD_TAG}" "${OTHER_IMAGE_TAGS}" "${BASE_FOR_IMAGE}"
   IMAGE_SHA=$(docker image inspect --format='{{.Id}}' "${IMAGE_BUILD_REGISTRY}/${IMAGE}:${IMAGE_BUILD_TAG}")
 
   if [[ "${GITHUB_ACTIONS:-false}" == "true" ]]; then

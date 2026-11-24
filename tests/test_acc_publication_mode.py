@@ -56,4 +56,13 @@ class PublicationModeTests(unittest.TestCase):
         self.assertTrue(result['production_authorization_required'])
         self.assertEqual(result['version'],'6.1.1.8')
 
+    def test_explicit_rc_and_post_versions_preserve_stream_semantics(self):
+        for tag, stream in [('6.1.1.8rc2', 'rc'), ('6.1.1.8.post1', 'release'), ('6.1.1.8', 'release')]:
+            result = mode.resolve('production', 'Release to pypi.org', tag, '55', stream=stream)
+            self.assertEqual(result['version'], tag)
+            self.assertEqual(result['stream'], stream)
+            self.assertEqual(result['release_tag'], '6.1.1.8')
+        for tag in ('6.1.1.8rc0', '6.1.1.8.post0', '6.1.1.8.post01', '6.1.1.8rc2.post1'):
+            with self.assertRaises(mode.ModeError): mode.resolve('production', 'Release to pypi.org', tag, '55')
+
 if __name__=='__main__':unittest.main()

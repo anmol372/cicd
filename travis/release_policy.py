@@ -33,9 +33,13 @@ class PolicyError(RuntimeError):
     """A release cannot be authorized or safely reconciled."""
 
 
+class PackageIndexError(PolicyError):
+    """An eligible publication failed at the package index."""
+
+
 SHA = re.compile(r"^[0-9a-f]{40}$")
 DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
-TAG = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$")
+TAG = re.compile(r"^(?P<base>[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)(?:rc[1-9][0-9]*|\.post[1-9][0-9]*)?$")
 RUNTIME_IMAGES = (
     "aci-containers-host", "aci-containers-controller", "cnideploy",
     "aci-containers-operator", "openvswitch", "aci-containers-webhook",
@@ -166,7 +170,7 @@ def validate_manifest(manifest, artifact=None):
 
 def tag_identity(repo, tag):
     if not TAG.fullmatch(tag):
-        raise PolicyError("production tag must have form N.N.N.N")
+        raise PolicyError("production tag must be R, RrcN or R.postN with positive canonical N")
     ref = "refs/tags/" + tag
     if git(repo, "cat-file", "-t", ref) != "tag":
         raise PolicyError("release tag must be annotated")
@@ -243,6 +247,8 @@ def validate_input_lock(lock, release_tag, observations):
         raise PolicyError("input lock must not contain its enclosing source/tag identity")
     if not SHA.fullmatch(str(lock.get("cicd_commit", ""))):
         raise PolicyError("locked CICD commit is required")
+    if "cli_source_sha" in lock and not SHA.fullmatch(str(lock["cli_source_sha"])):
+        raise PolicyError("independent CLI source must be a complete commit SHA")
     sources = lock.get("sources", {})
     if not isinstance(sources, dict) or any(not SHA.fullmatch(str(sources.get(repo, "")))
                                           for repo in ("noironetworks/opflex", "noironetworks/aci-containers")):
@@ -260,7 +266,8 @@ def validate_input_lock(lock, release_tag, observations):
         producer = entry.get("producer", {})
         source_repo = "noironetworks/opflex" if name == "opflex" else "noironetworks/aci-containers"
         if (producer.get("repository") != source_repo or producer.get("source_sha") != sources[source_repo]
-                or producer.get("cicd_commit") != lock["cicd_commit"]
+                or not SHA.fullmatch(str(producer.get("cicd_commit", "")))
+                or ("cli_source_sha" not in lock and producer.get("cicd_commit") != lock["cicd_commit"])
                 or not str(producer.get("run_id", "")).isdigit()
                 or int(producer.get("run_attempt", 0)) < 1):
             raise PolicyError("image producer identity does not match locked inputs")
@@ -382,6 +389,10 @@ def check_requirements(policy, lock, source_sha):
     if branch not in policy.get("source_branches", []):
         raise PolicyError("source branch is not authorized by release policy")
     sources = {**lock.get("sources", {}), policy["repository"]: source_sha}
+    if "cli_source_sha" in lock:
+        if not SHA.fullmatch(str(lock["cli_source_sha"])):
+            raise PolicyError("independent CLI source must be a complete commit SHA")
+        sources["noironetworks/aci-containers"] = lock["cli_source_sha"]
     result = []
     for item in required:
         repository = item.get("repository", policy["repository"])
@@ -521,7 +532,7 @@ def authorize(repo, tag, policy_path, public_key, lock_path, checks_path, observ
         raise PolicyError("package CICD revision does not match the signed input lock")
     if manifest["source_sha"] != identity["source_sha"]:
         raise PolicyError("package source does not match the signed release")
-    if manifest["aci_source_sha"] != lock["sources"]["noironetworks/aci-containers"]:
+    if manifest["aci_source_sha"] != lock.get("cli_source_sha", lock["sources"]["noironetworks/aci-containers"]):
         raise PolicyError("embedded binary source does not match the signed input lock")
     validate_package_pins(manifest, lock)
     return {"schema_version": 1, **identity, "package": manifest_identity(manifest),
@@ -557,7 +568,10 @@ def recheck(repo, authorization, manifest):
 def existing_package(manifest):
     root = INDEXES[manifest["index"]][0]
     url = root + "/pypi/" + urllib.parse.quote(manifest["name"], safe="") + "/" + urllib.parse.quote(manifest["version"], safe="") + "/json"
-    result = http_json(url, allow_missing=True)
+    try:
+        result = http_json(url, allow_missing=True)
+    except PolicyError as error:
+        raise PackageIndexError(str(error)) from error
     if result is None:
         return False
     info = result.get("info", {})
@@ -565,8 +579,10 @@ def existing_package(manifest):
         raise PolicyError("package index identity does not match")
     files = result.get("urls", [])
     matches = [item for item in files if item.get("filename") == manifest["filename"]]
-    if len(matches) != 1 or matches[0].get("digests", {}).get("sha256") != manifest["sha256"] or matches[0].get("yanked", False):
-        raise PolicyError("existing package filename/hash differs from retained artifact")
+    if len(matches) != 1 or matches[0].get("digests", {}).get("sha256") != manifest["sha256"]:
+        raise PackageIndexError("existing package filename/hash differs from retained artifact")
+    if matches[0].get("yanked", False):
+        raise PolicyError("existing package file is yanked")
     return True
 
 
@@ -593,7 +609,7 @@ def upload(manifest_path, receipt_path, authorization_path=None, repo=None, arti
             raise PolicyError("authorized dependency lock changed")
         if lock.get("cicd_commit") != git(Path(__file__).resolve().parent, "rev-parse", "HEAD"):
             raise PolicyError("recovery helper does not match the locked CICD revision")
-        if manifest["aci_source_sha"] != lock["sources"]["noironetworks/aci-containers"]:
+        if manifest["aci_source_sha"] != lock.get("cli_source_sha", lock["sources"]["noironetworks/aci-containers"]):
             raise PolicyError("embedded binary source does not match the signed input lock")
         validate_package_pins(manifest, lock)
         recheck(repo, authorization, manifest)
@@ -634,7 +650,7 @@ def upload(manifest_path, receipt_path, authorization_path=None, repo=None, arti
                 if existing_package(manifest):
                     break
                 if attempt == 4:
-                    raise PolicyError("uploaded artifact could not be verified") from upload_error
+                    raise PackageIndexError("uploaded artifact could not be verified") from upload_error
                 time.sleep(2 ** (attempt + 1))
     if authorization:
         recheck(repo, authorization, manifest)
@@ -667,6 +683,11 @@ def main(argv=None):
     auth = subs.add_parser("authorize")
     for option in ("repo", "tag", "policy", "public-key", "lock", "checks", "observations", "artifact-manifest", "output"):
         auth.add_argument("--" + option, required=True)
+    verify = subs.add_parser("verify-tag")
+    for option in ("repo", "tag", "policy", "public-key", "output"):
+        verify.add_argument("--" + option, required=True)
+    verify.add_argument("--expected-source-sha")
+    verify.add_argument("--expected-tag-object")
     publish = subs.add_parser("upload")
     for option in ("manifest", "receipt"):
         publish.add_argument("--" + option, required=True)
@@ -686,8 +707,18 @@ def main(argv=None):
         elif args.command == "authorize":
             write_json(args.output, authorize(args.repo, args.tag, args.policy, args.public_key, args.lock,
                                               args.checks, args.observations, args.artifact_manifest))
+        elif args.command == "verify-tag":
+            identity = verify_tag(args.repo, args.tag, load_json(args.policy), args.public_key)
+            assert_remote_tag(args.repo, identity)
+            if (args.expected_source_sha and identity["source_sha"] != args.expected_source_sha
+                    or args.expected_tag_object and identity["tag_object"] != args.expected_tag_object):
+                raise PolicyError("verified tag differs from captured selected identity")
+            write_json(args.output, identity)
         elif args.command == "upload":
             upload(args.manifest, args.receipt, args.authorization, args.repo, args.artifact, args.policy, args.public_key)
+    except PackageIndexError as error:
+        print("package index: " + str(error), file=sys.stderr)
+        return 3
     except (PolicyError, OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
         print("release policy: " + str(error), file=sys.stderr)
         return 1

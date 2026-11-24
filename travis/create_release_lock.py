@@ -22,7 +22,7 @@ from ci_evidence import EvidenceError, validate_bundle
 
 SHA = re.compile(r'[0-9a-f]{40}\Z')
 DIGEST = re.compile(r'sha256:[0-9a-f]{64}\Z')
-TAG = re.compile(r'[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\Z')
+TAG = re.compile(r'(?P<base>[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)(?:rc[1-9][0-9]*|\.post[1-9][0-9]*)?\Z')
 POSITIVE = re.compile(r'[1-9][0-9]*\Z')
 FIELDS = {
     'aci-containers-host': 'aci_containers_host_version',
@@ -97,7 +97,7 @@ def observed_digests(manifest):
     return observations
 
 
-def consumer_digest(record, registry, pin, base_tag, number, observations):
+def consumer_digest(record, registry, pin, base_tag, number, observations, rc_suffix=''):
     key = 'quay' if registry == 'quay.io/noiro' else 'docker'
     records = record.get(key)
     if not isinstance(records, list) or len(records) != 2:
@@ -115,7 +115,7 @@ def consumer_digest(record, registry, pin, base_tag, number, observations):
     dated = [tag for tag in tags if re.fullmatch(re.escape(base_tag) + r'\.[0-9]{6}\.' + re.escape(number), tag)]
     if z_tag not in tags or len(dated) != 1 or tags[z_tag] != tags[dated[0]]:
         raise LockError('published z and dated results do not identify one image')
-    if pin == base_tag:
+    if pin == base_tag + rc_suffix:
         return tags[z_tag]
     if pin in tags and pin != z_tag:
         return tags[pin]
@@ -142,9 +142,12 @@ def dependencies(values):
     return [{'reference': reference, 'digest': result[reference]} for reference in sorted(result)]
 
 
-def create_lock(bundle_paths, release_tag, source_branch, cicd_commit, versions_file, dependency_values):
+def create_lock(bundle_paths, release_tag, source_branch, cicd_commit, versions_file, dependency_values, cli_source_sha=None):
     if not TAG.fullmatch(release_tag) or not SHA.fullmatch(cicd_commit):
         raise LockError('release tag and full CICD SHA are required')
+    if cli_source_sha is not None and not SHA.fullmatch(cli_source_sha):
+        raise LockError('independent CLI source must be a complete commit SHA')
+    base_release = TAG.fullmatch(release_tag).group('base')
     if source_branch not in ('master', 'mmr-' + '.'.join(release_tag.split('.')[:3])):
         raise LockError('source branch must identify the production master or MMR line')
     pins = production_pins(versions_file, release_tag)
@@ -158,7 +161,8 @@ def create_lock(bundle_paths, release_tag, source_branch, cicd_commit, versions_
         bundle_roots.add(path.resolve())
         manifest, _ = validate_bundle(path)
         if (manifest['kind'] != 'images' or manifest['directory'] != 'z'
-                or manifest['release_tag'] != release_tag or manifest['cicd']['sha'] != cicd_commit):
+                or manifest['release_tag'] != base_release
+                or (cli_source_sha is None and manifest['cicd']['sha'] != cicd_commit)):
             raise LockError('bundle release, kind, or CICD revision differs from the requested cohort')
         source = manifest['source']; repository = source['repository']; source_sha = source['sha']
         if repository not in ('noironetworks/aci-containers', 'noironetworks/opflex') or not SHA.fullmatch(source_sha):
@@ -179,7 +183,7 @@ def create_lock(bundle_paths, release_tag, source_branch, cicd_commit, versions_
         run = manifest['run']
         if any(not POSITIVE.fullmatch(str(run.get(field, ''))) for field in ('id', 'number', 'attempt')):
             raise LockError('bundle needs distinct positive API run ID, number, and attempt')
-        if run.get('trigger_tag') != release_tag or not re.fullmatch(r'[0-9a-f]+', str(run.get('upstream_id', ''))):
+        if run.get('trigger_tag') != base_release or not re.fullmatch(r'[0-9a-f]+', str(run.get('upstream_id', ''))):
             raise LockError('bundle trigger or upstream identity is inconsistent')
         upstream_ids.add(run['upstream_id'])
         cohort = (source_sha, str(run['id']), str(run['number']), int(run['attempt']))
@@ -191,7 +195,7 @@ def create_lock(bundle_paths, release_tag, source_branch, cicd_commit, versions_
         records = manifest['records']
         if len(image_ids) != len(set(image_ids)) or set(image_ids) != {record['name'] for record in records}:
             raise LockError('bundle image identities do not match its records')
-        base_tag = release_tag + '.' + run['upstream_id']
+        base_tag = base_release + '.' + run['upstream_id']
         for record in records:
             name = record['name']
             expected_repo = 'noironetworks/opflex' if name == 'opflex' else 'noironetworks/aci-containers'
@@ -204,9 +208,10 @@ def create_lock(bundle_paths, release_tag, source_branch, cicd_commit, versions_
             registries = {}
             for registry in ('quay.io/noiro', 'docker.io/noiro'):
                 registries[registry] = {'reference': registry + '/' + name + ':' + pins[name],
-                    'digest': consumer_digest(record, registry, pins[name], base_tag, str(run['number']), observations)}
+                    'digest': consumer_digest(record, registry, pins[name], base_tag, str(run['number']), observations,
+                                              '.' + release_tag[len(base_release):] if release_tag[len(base_release):].startswith('rc') else '')}
             images[name] = {'platform': 'linux/amd64',
-                'producer': {'repository': repository, 'source_sha': source_sha, 'cicd_commit': cicd_commit,
+                'producer': {'repository': repository, 'source_sha': source_sha, 'cicd_commit': manifest['cicd']['sha'],
                              'run_id': str(run['id']), 'run_attempt': int(run['attempt'])},
                 'registries': registries}
     if set(images) != set(FIELDS) or set(sources) != {'noironetworks/aci-containers', 'noironetworks/opflex'} or len(upstream_ids) != 1:
@@ -221,11 +226,14 @@ def create_lock(bundle_paths, release_tag, source_branch, cicd_commit, versions_
     consumer_refs = {item['reference'] for entry in images.values() for item in entry['registries'].values()}
     if any(item['reference'] in consumer_refs for item in locked_dependencies):
         raise LockError('dependency cannot duplicate a runtime consumer constraint')
-    return {'schema_version': 1, 'release_tag': release_tag, 'source_branch': source_branch,
+    result = {'schema_version': 1, 'release_tag': release_tag, 'source_branch': source_branch,
             'cicd_commit': cicd_commit, 'sources': sources,
             'build_inputs': build_proofs,
             'images': {name: images[name] for name in sorted(images)},
             'dependencies': locked_dependencies}
+    if cli_source_sha is not None:
+        result['cli_source_sha'] = cli_source_sha
+    return result
 
 
 def main(argv=None):
@@ -234,10 +242,11 @@ def main(argv=None):
     for flag in ('release-tag', 'source-branch', 'cicd-commit', 'versions-file', 'output'):
         parser.add_argument('--' + flag, required=True)
     parser.add_argument('--dependency', action='append', required=True, help='REF=sha256:DIGEST; must include opflex-build-base')
+    parser.add_argument('--cli-source-sha', help='independent tested embedded CLI source, retaining original image producer revisions')
     args = parser.parse_args(argv)
     try:
         result = create_lock(args.bundle, args.release_tag, args.source_branch, args.cicd_commit,
-                             args.versions_file, args.dependency)
+                             args.versions_file, args.dependency, args.cli_source_sha)
         output = Path(args.output); output.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile('w', dir=output.parent, delete=False, encoding='utf-8') as stream:
             json.dump(result, stream, indent=2, sort_keys=True); stream.write('\n'); temporary = Path(stream.name)

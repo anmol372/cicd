@@ -349,8 +349,10 @@ def main():
         if args.expected_digest and result["state"] != "ok":
             parser.exit(1, "Expected build-base digest was not verified\n")
     elif args.command == "capture-input":
+        from rehearsal_quay import REGISTRY, active
+        registry = REGISTRY if active() else "quay.io/noirolabs"
         if (not DIGEST.fullmatch(args.expected_digest)
-                or args.reference != "quay.io/noirolabs/opflex-build-base@" + args.expected_digest):
+                or args.reference != f"{registry}/opflex-build-base@" + args.expected_digest):
             parser.exit(1, "The approved build input must be an immutable canonical reference\n")
         result = capture_base(None, args.output, pull=True, expected_digest=args.expected_digest,
                               reference=args.reference)

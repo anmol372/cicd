@@ -98,6 +98,22 @@ def now():
     return datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
+def rehearsal_context():
+    if os.environ.get("CI_REHEARSAL") != "1":
+        return None
+    repository = os.environ.get("GITHUB_REPOSITORY", "")
+    if (os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch"
+            or os.environ.get("GITHUB_REF") != "refs/heads/anmrasto/gha-rehearsal-20261119"
+            or repository not in {"anmol372/opflex", "anmol372/aci-containers", "anmol372/acc-provision"}):
+        raise EvidenceError("rehearsal requires the dedicated manual test workflow context")
+    result = {"repository": repository, "event": "workflow_dispatch", "workflow_ref": os.environ["GITHUB_REF"]}
+    if os.environ.get("GITHUB_SHA"):
+        if not SHA.fullmatch(os.environ["GITHUB_SHA"]):
+            raise EvidenceError("invalid rehearsal workflow execution SHA")
+        result["workflow_sha"] = os.environ["GITHUB_SHA"]
+    return result
+
+
 def severity(text):
     values = []
     started = False
@@ -161,8 +177,21 @@ def report_counts(text):
 
 
 def identity(args):
-    for key in ("release_tag", "trigger_tag", "upstream_id", "run_id"):
+    rehearsal = rehearsal_context()
+    source_ref = getattr(args, "source_ref", None)
+    for key in ("release_tag", "upstream_id", "run_id"):
         valid_name(getattr(args, key), key)
+    if source_ref:
+        if not rehearsal or getattr(args, "trigger_tag", None):
+            raise EvidenceError("source-ref is exclusive to an explicit rehearsal source identity")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./-]*", source_ref) or ".." in source_ref:
+            raise EvidenceError("invalid selected source ref")
+        if args.source_repository != rehearsal["repository"]:
+            raise EvidenceError("rehearsal source repository differs from actual fork")
+    else:
+        valid_name(args.trigger_tag, "trigger_tag")
+        if rehearsal:
+            raise EvidenceError("rehearsal must record its actual source-ref, not a release tag")
     if not isinstance(args.source_repository, str) or not re.fullmatch(
             r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.source_repository):
         raise EvidenceError("invalid source repository")
@@ -173,10 +202,16 @@ def identity(args):
         raise EvidenceError("run number and attempt must be positive integers")
     cicd_sha = run(["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parent,
                    env=clean_environment()).strip()
-    return {"source": {"repository": args.source_repository, "sha": args.source_sha},
+    result = {"source": {"repository": args.source_repository, "sha": args.source_sha},
             "cicd": {"sha": cicd_sha},
             "run": {"id": args.run_id, "number": number, "attempt": args.run_attempt, "url": args.run_url,
-                    "trigger_tag": args.trigger_tag, "upstream_id": args.upstream_id}}
+                    "upstream_id": args.upstream_id}}
+    if source_ref:
+        result["run"]["source_ref"] = source_ref
+        result["rehearsal"] = rehearsal
+    else:
+        result["run"]["trigger_tag"] = args.trigger_tag
+    return result
 
 
 class Builder:
@@ -261,7 +296,7 @@ def commit_record(args):
 def generated_log(args, directory):
     path = directory / "buildlog.txt"
     path.write_text(f"GitHub Actions run: {args.run_url}\nSource commit: {args.source_sha}\n"
-                    f"Trigger tag: {args.trigger_tag}\n", encoding="utf-8")
+                    + (f"Source ref: {args.source_ref}\n" if getattr(args, "source_ref", None) else f"Trigger tag: {args.trigger_tag}\n"), encoding="utf-8")
     return path
 
 
@@ -318,6 +353,10 @@ def prepare_images(args):
             scan_data = copy.deepcopy(row.get("scan") or {})
             base_digest = scan_data.get("base", {}).get("base_repository_digest", "").removeprefix("sha256:")
             registry_records = {"quay": [], "docker": []}
+            if builder.manifest.get("rehearsal"):
+                if registry != "quay.io/anmrasto":
+                    raise EvidenceError("rehearsal evidence requires the fixed private image registry")
+                registry_records["rehearsal"] = []
             if row.get("publication"):
                 # Receipts describe only verified attempts; never read an old
                 # alias after a partial push and report it as this build.
@@ -326,6 +365,8 @@ def prepare_images(args):
                         raise EvidenceError("invalid publication receipt digest")
                     builder.manifest["observations"].append({"reference": item["reference"], "digest": item["digest"]})
                     key = item["registry"]
+                    if key == "rehearsal" and (not builder.manifest.get("rehearsal") or item.get("reference") != f"quay.io/anmrasto/{image}:{item.get('tag')}"):
+                        raise EvidenceError("rehearsal receipt has an invalid private image reference")
                     if key in registry_records:
                         digest = item["digest"].removeprefix("sha256:")
                         link = (f"https://hub.docker.com/layers/noiro/{image}/{item['tag']}/images/sha256-{digest}?context=explore"
@@ -409,10 +450,10 @@ def prepare_images(args):
 
 def historical_artifacts(checkout, image, release, digest):
     """Select the existing z evidence or the historical commit matching image ID."""
-    current = image["quay"][0]["sha"]
+    current = image["rehearsal" if image.get("rehearsal") else "quay"][0]["sha"]
     if current == digest:
         return checkout, None
-    ref = f"quay.io/noiro/{image['name']}:{image['_promotion_tag']}"
+    ref = f"{image.get('_promotion_registry', 'quay.io/noiro')}/{image['name']}:{image['_promotion_tag']}"
     image_id = run(["docker", "image", "inspect", "--format", "{{.Id}}", ref], env=clean_environment()).strip()
     if not DIGEST.fullmatch(image_id):
         raise EvidenceError("invalid promoted image ID")
@@ -442,6 +483,260 @@ def historical_artifacts(checkout, image, release, digest):
                                      cwd=checkout, env=clean_environment()), encoding="utf-8")
     return directory, directory
 
+
+def fingerprint(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def selected_stream(data, release_tag, stream):
+    release = next((item for item in (data or {}).get("releases", []) if item.get("release_tag") == release_tag), None)
+    target = next((item for item in (release or {}).get("release_streams", []) if item.get("release_name") == stream), None)
+    return release, target
+
+
+def stream_identity(args):
+    if args.mode == "rc":
+        if not args.rc_number or not re.fullmatch(r"[1-9][0-9]*", args.rc_number):
+            raise EvidenceError("--rc-number must be positive for RC preparation")
+        return "rc" + args.rc_number, args.release_tag + ".rc" + args.rc_number
+    return ("r", args.release_tag) if args.mode == "release" else ("z", args.release_tag + ".z")
+
+
+def status_target(args, required=False):
+    if not args.status_checkout:
+        raise EvidenceError("release evidence requires --status-checkout")
+    checkout = Path(args.status_checkout).resolve()
+    status = yaml.safe_load(local_file(checkout, "docs/release_artifacts/releases.yaml").read_text())
+    _, stream = stream_identity(args)
+    release, target = selected_stream(status, args.release_tag, stream)
+    if release is None or (required and (target is None or not target.get("acc_provision"))):
+        raise EvidenceError("selected existing release/stream package is missing")
+    return checkout, status, release, target
+
+
+def selection_key(manifest):
+    return manifest["source"]["repository"] + ":" + ",".join(sorted(record["name"] for record in manifest["records"]))
+
+
+def evidence_index(checkout, manifest):
+    path = safe_destination(checkout, f"docs/release_artifacts/{manifest['release_tag']}/{manifest['directory']}/.ci-evidence.json")
+    index = json.loads(path.read_text()) if path.exists() else {"schema_version": 1, "components": {}}
+    if index.get("schema_version") != 1 or not isinstance(index.get("components"), dict):
+        raise EvidenceError("invalid publication identity index")
+    return path, index
+
+
+def capture_selection(manifest, checkout, explicit=False):
+    _, index = evidence_index(checkout, manifest)
+    current = index.get("image_selections", {}).get(selection_key(manifest))
+    if current is not None or explicit:
+        manifest["image_selection_base"] = current
+
+
+def existing_image_proof(checkout, target):
+    records = target.get("container_images", [])
+    names = [valid_name(item["name"], "image name") for item in records]
+    if not names or len(names) != len(set(names)):
+        raise EvidenceError("package-only update requires a complete existing image cohort")
+    files = {}
+    for record in records:
+        for key in ("sbom", "cve", "build-logs"):
+            path = "docs/" + str(relative_path(record[key]))
+            files[path] = digest_file(local_file(checkout, path))
+    return {"names": names, "records_sha256": fingerprint(records), "files": files}
+
+
+def prepare_image_refresh(args):
+    directory, stream = stream_identity(args)
+    if directory == "z":
+        raise EvidenceError("rolling preview cannot refresh release image status")
+    checkout, status, release, target = status_target(args, required=True)
+    builder = Builder(args, "image-refresh", stream, directory)
+    try:
+        for key in ("images", "retained_files"):
+            del builder.manifest[key]
+        if not builder.manifest.get("rehearsal"):
+            if not SHA.fullmatch(args.tag_object or ""):
+                raise EvidenceError("refresh requires the captured raw tag object")
+            raw = args.trigger_tag
+            grammar = re.escape(args.release_tag) + (r"rc" + args.rc_number if args.mode == "rc" else r"(?:\.post[1-9][0-9]*)?")
+            if not re.fullmatch(grammar, raw):
+                raise EvidenceError("refresh raw tag does not match release intent")
+            builder.manifest["run"]["tag_object"] = args.tag_object
+        builder.manifest["known_package"] = {"record_sha256": fingerprint(target["acc_provision"])}
+        select_existing_images(args, builder, checkout, release)
+        capture_selection(builder.manifest, checkout, explicit=True)
+        names = [record["name"] for record in builder.manifest["records"]]
+        expected = args.expected_images.split(",")
+        if not expected or len(set(expected)) != len(expected) or set(names) != set(expected):
+            raise EvidenceError("refresh requires the complete expected image cohort")
+        builder.finish()
+    finally:
+        shutil.rmtree(builder.temp, ignore_errors=True)
+
+
+def package_status_route(args):
+    """Select the data path; publication still validates all retained evidence."""
+    if args.mode == "z":
+        if not args.receipt:
+            raise EvidenceError("preview requires a successful verified package receipt")
+        result = {"kind": "package"}
+    else:
+        checkout, status, release, target = status_target(args)
+        known = (target or {}).get("acc_provision", [])
+        if not args.receipt:
+            if not known:
+                raise EvidenceError("failed package attempt has no known selected release package")
+            result = {"kind": "image-refresh"}
+        else:
+            receipt = json.loads(local_file(Path(args.receipt).parent, Path(args.receipt).name).read_text())
+            if receipt.get("verified") is not True or receipt.get("schema_version") != 1:
+                raise EvidenceError("package route requires a verified upload receipt")
+            selected = receipt.get("package", {})
+            if selected.get("version") != args.version or selected.get("index") != args.index:
+                raise EvidenceError("package route receipt differs from requested version/index")
+            root = "https://pypi.org" if args.index == "pypi" else "https://test.pypi.org"
+            matches = any(item.get("tag") == args.version and item.get("link", "").startswith(root + "/") for item in known)
+            result = {"kind": "image-refresh" if receipt.get("reused_existing") is True and matches else "package"}
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(result, sort_keys=True) + "\n")
+
+
+def guard_current_state(checkout, data, manifest, receipt, index):
+    _, target = selected_stream(data, manifest["release_tag"], manifest["stream"])
+    package = (target or {}).get("acc_provision", [])
+    if manifest["kind"] == "image-refresh":
+        if not package or fingerprint(package) != manifest["known_package"]["record_sha256"]:
+            raise EvidenceError("selected package changed; re-prepare image refresh")
+    if "prior_package" in manifest:
+        expected = manifest["prior_package"]["record_sha256"]
+        if (fingerprint(package) if target else None) != expected:
+            raise EvidenceError("selected package changed; re-prepare package status")
+    if receipt and receipt.get("reused_existing") is True:
+        proposed = manifest["package"]
+        selected = manifest["package_artifact"]
+        root = "https://pypi.org" if selected["index"] == "pypi" else "https://test.pypi.org"
+        matching = any(item.get("tag") == selected["version"] and item.get("link", "").startswith(root + "/") for item in package)
+        if matching and package != proposed:
+            raise EvidenceError("known package provenance is immutable; use prepare-image-refresh")
+    if manifest.get("package_only"):
+        if not target or existing_image_proof(checkout, target) != manifest["existing_images"]:
+            raise EvidenceError("approved existing image cohort changed; re-prepare package-only update")
+    selects = manifest["kind"] in ("package", "image-refresh") and manifest["directory"] != "z" and manifest["records"]
+    if selects:
+        current = index.setdefault("image_selections", {}).get(selection_key(manifest))
+        if current != manifest.get("image_selection_base"):
+            raise EvidenceError("image selection changed; re-prepare against current image evidence")
+        index["image_selections"][selection_key(manifest)] = fingerprint({"records": manifest["records"],
+            "files": [item for item in manifest["files"] if PurePosixPath(item["path"]).parts[4] != "acc-provision"]})
+
+
+def select_existing_images(args, builder, checkout, release):
+    """Read existing aliases and copy their retained evidence; never writes tags."""
+    directory = builder.manifest["directory"]
+    z = next(item for item in release["release_streams"] if item["release_name"] == args.release_tag + ".z")
+    tag = f"{args.release_tag}.{args.upstream_id}"
+    if args.mode == "rc":
+        tag += ".rc" + args.rc_number
+    for original in z["container_images"]:
+        image = copy.deepcopy(original)
+        name = valid_name(image["name"], "image name")
+        private = bool(builder.manifest.get("rehearsal"))
+        registry = "quay.io/anmrasto" if private else "quay.io/noiro"
+        quay = resolve_digest(f"{registry}/{name}:{tag}", builder.manifest["observations"])
+        docker = quay if private else resolve_digest(f"noiro/{name}:{tag}", builder.manifest["observations"])
+        image["_promotion_tag"] = tag
+        image["_promotion_registry"] = registry
+        # Historical selection also checks the Docker digest, as legacy did.
+        check_digest = quay if private or docker == original["docker"][0]["sha"] else "mismatch"
+        origin, cleanup = historical_artifacts(checkout, image, args.release_tag, check_digest)
+        try:
+            if cleanup:
+                historical = yaml.safe_load(local_file(origin, "docs/release_artifacts/releases.yaml").read_text())
+                historical_release = next(item for item in historical["releases"] if item["release_tag"] == args.release_tag)
+                historical_stream = next(item for item in historical_release["release_streams"] if item["release_name"] == args.release_tag + ".z")
+                image = copy.deepcopy(next(item for item in historical_stream["container_images"] if item["name"] == name))
+            if builder.manifest["kind"] == "image-refresh" or private:
+                if image.get("publication", {}).get("state", "complete") != "complete":
+                    raise EvidenceError("selected image publication did not complete")
+                if (image["rehearsal"][0]["sha"] != quay if private else image["quay"][0]["sha"] != quay or image["docker"][0]["sha"] != docker):
+                    raise EvidenceError("existing aliases do not match retained image evidence")
+            old_prefix = f"release_artifacts/{args.release_tag}/z/{name}/"
+            new_prefix = f"release_artifacts/{args.release_tag}/{directory}/{name}/"
+            # Preserve every historical byte, including Quay JSON,
+            # provenance SHA files and CR/non-UTF-8 Travis logs.
+            artifact_root = origin / "docs" / old_prefix
+            for source in sorted(artifact_root.rglob("*")):
+                if source.is_symlink():
+                    raise EvidenceError("symlink release artifact is prohibited")
+                if source.is_file():
+                    builder.add(source, "docs/" + new_prefix + source.relative_to(artifact_root).as_posix())
+            record = {k: v for k, v in image.items() if not k.startswith("_")}
+            # Refresh observations belong to the independently scheduled
+            # target stream; promotion carries build evidence only.
+            if isinstance(record.get("scan"), dict):
+                record["scan"].pop("refresh", None)
+            record.update({"quay": [{"tag": tag, "sha": quay, "link": f"https://quay.io/noiro/{name}:{tag}"}],
+                           "docker": [{"tag": tag, "sha": docker, "link": f"https://hub.docker.com/layers/noiro/{name}/{tag}/images/sha256-{docker}?context=explore"}],
+                           "sbom": new_prefix + args.release_tag + "-sbom.txt",
+                           "cve": new_prefix + args.release_tag + "-cve.txt",
+                           "build-logs": new_prefix + args.release_tag + "-buildlog.txt",
+                           "build-time": builder.manifest["prepared_at"]})
+            if private:
+                record.update(quay=[], docker=[], rehearsal=[{"tag": tag, "sha": quay, "link": f"https://{registry}/{name}:{tag}"}])
+            build_scan = record.get("scan", {}).get("build", {}).get("image", {})
+            if build_scan:
+                if build_scan.get("state") == "ok":
+                    record["severity"] = [build_scan["counts"]]
+                else:
+                    record.pop("severity", None)
+            else:
+                counts = report_counts(local_file(origin, "docs/" + old_prefix + args.release_tag + "-cve.txt").read_text(errors="replace"))
+                if counts is None:
+                    record.pop("severity", None)
+                else:
+                    record["severity"] = [counts]
+            record["severity_type"] = "grype"
+            for field in ("cve_error", "severity_link"):
+                record.pop(field, None)
+            for base in record.get("base-image", []):
+                if base.get("cve", "").startswith(old_prefix):
+                    base["cve"] = new_prefix + base["cve"][len(old_prefix):]
+            original_path = origin / "docs" / old_prefix / (args.release_tag + "-cve-base-original.txt")
+            if not original_path.exists():
+                original_path = local_file(origin, "docs/" + old_prefix + args.release_tag + "-cve-base.txt")
+            original_destination = "docs/" + new_prefix + args.release_tag + "-cve-base-original.txt"
+            if not any(item["path"] == original_destination for item in builder.manifest["files"]):
+                builder.add(original_path, original_destination)
+            original_text = original_path.read_text(errors="replace")
+            original_counts = report_counts(original_text)
+            original_base = {"cve": new_prefix + args.release_tag + "-cve-base-original.txt",
+                             "severity_type": "grype" if original_counts is not None else "unknown", "date-and-time": builder.manifest["prepared_at"]}
+            if record["base-image"][0].get("sha"):
+                original_base["sha"] = record["base-image"][0]["sha"]
+            if original_counts is not None:
+                original_base["severity"] = [original_counts]
+            record["base-image-original"] = [original_base]
+            for namespace in record.get("scan", {}).values():
+                for target in namespace.values():
+                    for field in (target, target.get("last_success", {})):
+                        if field.get("report", "").startswith(old_prefix):
+                            original_report = field["report"]
+                            promoted_report = new_prefix + original_report[len(old_prefix):]
+                            if not any(item["path"] == "docs/" + promoted_report for item in builder.manifest["files"]):
+                                builder.add(local_file(origin, "docs/" + original_report), "docs/" + promoted_report)
+                            field["report"] = promoted_report
+            sha_path = origin / "docs" / old_prefix / (args.release_tag + "-base-image-sha.txt")
+            if sha_path.exists():
+                saved_sha = local_file(origin, "docs/" + old_prefix + args.release_tag + "-base-image-sha.txt").read_text().strip().removeprefix("sha256:")
+                if re.fullmatch(r"[0-9a-f]{64}", saved_sha):
+                    record["base-image-original"][0]["sha"] = saved_sha
+            record["update-release-cves-until"] = (datetime.now(ZoneInfo("America/Los_Angeles")) + timedelta(days=730)).strftime("%Y-%m-%d %H:%M:%S %Z")
+            builder.manifest["records"].append(record)
+        finally:
+            if cleanup:
+                shutil.rmtree(cleanup)
 
 def prepare_package(args):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", args.version):
@@ -476,101 +771,16 @@ def prepare_package(args):
         if args.mode != "z" and "post" not in args.version:
             if not args.status_checkout:
                 raise EvidenceError("release/RC promotion requires --status-checkout")
-            checkout = Path(args.status_checkout).resolve()
-            status = yaml.safe_load(local_file(checkout, "docs/release_artifacts/releases.yaml").read_text())
-            release = next(item for item in status["releases"] if item["release_tag"] == args.release_tag)
-            z = next(item for item in release["release_streams"] if item["release_name"] == args.release_tag + ".z")
-            tag = f"{args.release_tag}.{args.upstream_id}"
-            if args.mode == "rc":
-                tag += ".rc" + args.rc_number
-            for original in z["container_images"]:
-                image = copy.deepcopy(original)
-                name = valid_name(image["name"], "image name")
-                quay = resolve_digest(f"quay.io/noiro/{name}:{tag}", builder.manifest["observations"])
-                docker = resolve_digest(f"noiro/{name}:{tag}", builder.manifest["observations"])
-                image["_promotion_tag"] = tag
-                # Historical selection also checks the Docker digest, as legacy did.
-                check_digest = quay if docker == original["docker"][0]["sha"] else "mismatch"
-                origin, cleanup = historical_artifacts(checkout, image, args.release_tag, check_digest)
-                try:
-                    if cleanup:
-                        historical = yaml.safe_load(local_file(origin, "docs/release_artifacts/releases.yaml").read_text())
-                        historical_release = next(item for item in historical["releases"] if item["release_tag"] == args.release_tag)
-                        historical_stream = next(item for item in historical_release["release_streams"] if item["release_name"] == args.release_tag + ".z")
-                        image = copy.deepcopy(next(item for item in historical_stream["container_images"] if item["name"] == name))
-                    old_prefix = f"release_artifacts/{args.release_tag}/z/{name}/"
-                    new_prefix = f"release_artifacts/{args.release_tag}/{directory}/{name}/"
-                    # Preserve every historical byte, including Quay JSON,
-                    # provenance SHA files and CR/non-UTF-8 Travis logs.
-                    artifact_root = origin / "docs" / old_prefix
-                    for source in sorted(artifact_root.rglob("*")):
-                        if source.is_symlink():
-                            raise EvidenceError("symlink release artifact is prohibited")
-                        if source.is_file():
-                            builder.add(source, "docs/" + new_prefix + source.relative_to(artifact_root).as_posix())
-                    record = {k: v for k, v in image.items() if not k.startswith("_")}
-                    # Refresh observations belong to the independently scheduled
-                    # target stream; promotion carries build evidence only.
-                    if isinstance(record.get("scan"), dict):
-                        record["scan"].pop("refresh", None)
-                    record.update({"quay": [{"tag": tag, "sha": quay, "link": f"https://quay.io/noiro/{name}:{tag}"}],
-                                   "docker": [{"tag": tag, "sha": docker, "link": f"https://hub.docker.com/layers/noiro/{name}/{tag}/images/sha256-{docker}?context=explore"}],
-                                   "sbom": new_prefix + args.release_tag + "-sbom.txt",
-                                   "cve": new_prefix + args.release_tag + "-cve.txt",
-                                   "build-logs": new_prefix + args.release_tag + "-buildlog.txt",
-                                   "build-time": builder.manifest["prepared_at"]})
-                    build_scan = record.get("scan", {}).get("build", {}).get("image", {})
-                    if build_scan:
-                        if build_scan.get("state") == "ok":
-                            record["severity"] = [build_scan["counts"]]
-                        else:
-                            record.pop("severity", None)
-                    else:
-                        counts = report_counts(local_file(origin, "docs/" + old_prefix + args.release_tag + "-cve.txt").read_text(errors="replace"))
-                        if counts is None:
-                            record.pop("severity", None)
-                        else:
-                            record["severity"] = [counts]
-                    record["severity_type"] = "grype"
-                    for field in ("cve_error", "severity_link"):
-                        record.pop(field, None)
-                    for base in record.get("base-image", []):
-                        if base.get("cve", "").startswith(old_prefix):
-                            base["cve"] = new_prefix + base["cve"][len(old_prefix):]
-                    original_path = origin / "docs" / old_prefix / (args.release_tag + "-cve-base-original.txt")
-                    if not original_path.exists():
-                        original_path = local_file(origin, "docs/" + old_prefix + args.release_tag + "-cve-base.txt")
-                    original_destination = "docs/" + new_prefix + args.release_tag + "-cve-base-original.txt"
-                    if not any(item["path"] == original_destination for item in builder.manifest["files"]):
-                        builder.add(original_path, original_destination)
-                    original_text = original_path.read_text(errors="replace")
-                    original_counts = report_counts(original_text)
-                    original_base = {"cve": new_prefix + args.release_tag + "-cve-base-original.txt",
-                                     "severity_type": "grype" if original_counts is not None else "unknown", "date-and-time": builder.manifest["prepared_at"]}
-                    if record["base-image"][0].get("sha"):
-                        original_base["sha"] = record["base-image"][0]["sha"]
-                    if original_counts is not None:
-                        original_base["severity"] = [original_counts]
-                    record["base-image-original"] = [original_base]
-                    for namespace in record.get("scan", {}).values():
-                        for target in namespace.values():
-                            for field in (target, target.get("last_success", {})):
-                                if field.get("report", "").startswith(old_prefix):
-                                    original_report = field["report"]
-                                    promoted_report = new_prefix + original_report[len(old_prefix):]
-                                    if not any(item["path"] == "docs/" + promoted_report for item in builder.manifest["files"]):
-                                        builder.add(local_file(origin, "docs/" + original_report), "docs/" + promoted_report)
-                                    field["report"] = promoted_report
-                    sha_path = origin / "docs" / old_prefix / (args.release_tag + "-base-image-sha.txt")
-                    if sha_path.exists():
-                        saved_sha = local_file(origin, "docs/" + old_prefix + args.release_tag + "-base-image-sha.txt").read_text().strip().removeprefix("sha256:")
-                        if re.fullmatch(r"[0-9a-f]{64}", saved_sha):
-                            record["base-image-original"][0]["sha"] = saved_sha
-                    record["update-release-cves-until"] = (datetime.now(ZoneInfo("America/Los_Angeles")) + timedelta(days=730)).strftime("%Y-%m-%d %H:%M:%S %Z")
-                    builder.manifest["records"].append(record)
-                finally:
-                    if cleanup:
-                        shutil.rmtree(cleanup)
+            checkout, status, release, target = status_target(args)
+            select_existing_images(args, builder, checkout, release)
+            capture_selection(builder.manifest, checkout)
+        elif args.mode != "z":
+            if args.mode != "release" or not re.fullmatch(re.escape(args.release_tag) + r"\.post[1-9][0-9]*", args.version):
+                raise EvidenceError("package-only updates require canonical R.postN")
+            checkout, status, release, target = status_target(args, required=True)
+            builder.manifest["package_only"] = True
+            builder.manifest["prior_package"] = {"record_sha256": fingerprint(target.get("acc_provision", []))}
+            builder.manifest["existing_images"] = existing_image_proof(checkout, target)
         builder.finish()
     finally:
         shutil.rmtree(builder.temp, ignore_errors=True)
@@ -581,7 +791,7 @@ def validate_bundle(root):
     if root.is_symlink():
         raise EvidenceError("bundle root may not be a symlink")
     manifest = json.loads(local_file(root, "manifest.json").read_text(encoding="utf-8"))
-    if manifest.get("schema_version") != SCHEMA_VERSION or manifest.get("kind") not in ("images", "package"):
+    if manifest.get("schema_version") != SCHEMA_VERSION or manifest.get("kind") not in ("images", "package", "image-refresh"):
         raise EvidenceError("unsupported bundle schema")
     release = valid_name(manifest["release_tag"], "release tag")
     directory = manifest["directory"]
@@ -597,7 +807,18 @@ def validate_bundle(root):
     for key in ("id", "number", "attempt"):
         if not isinstance(manifest["run"].get(key), str) or not re.fullmatch(r"[1-9][0-9]*", manifest["run"][key]):
             raise EvidenceError("invalid bundle run identity")
-    for key in ("trigger_tag", "upstream_id"):
+    if manifest.get("rehearsal"):
+        retained = manifest["rehearsal"]
+        if (not rehearsal_context() or retained.get("event") != "workflow_dispatch"
+                or retained.get("workflow_ref") != "refs/heads/anmrasto/gha-rehearsal-20261119"
+                or retained.get("repository") != manifest["source"]["repository"]
+                or retained.get("repository") not in {"anmol372/opflex", "anmol372/aci-containers", "anmol372/acc-provision"}
+                or "trigger_tag" in manifest["run"] or not manifest["run"].get("source_ref")
+                or ("workflow_sha" in retained and not SHA.fullmatch(str(retained["workflow_sha"])))):
+            raise EvidenceError("invalid rehearsal source identity")
+    else:
+        valid_name(manifest["run"]["trigger_tag"], "run trigger_tag")
+    for key in ("upstream_id",):
         valid_name(manifest["run"][key], "run " + key)
     if not isinstance(manifest["prepared_at"], str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} (?:PST|PDT)", manifest["prepared_at"]):
         raise EvidenceError("invalid prepared timestamp")
@@ -605,6 +826,27 @@ def validate_bundle(root):
         raise EvidenceError("image bundles may update only the z stream")
     if manifest["kind"] == "package" and manifest.get("images"):
         raise EvidenceError("package bundles may not forge image build history")
+    if manifest["kind"] == "image-refresh":
+        if (directory == "z" or not manifest.get("records") or manifest.get("failed_records") != []
+                or any(key in manifest for key in ("package", "package_artifact", "released", "images", "retained_files"))
+                or "image_selection_base" not in manifest
+                or not re.fullmatch(r"[0-9a-f]{64}", manifest.get("known_package", {}).get("record_sha256", ""))
+                or (not manifest.get("rehearsal") and not SHA.fullmatch(manifest["run"].get("tag_object", "")))):
+            raise EvidenceError("invalid status-only image-refresh bundle")
+        tag = release + "." + manifest["run"]["upstream_id"] + ("." + directory if directory.startswith("rc") else "")
+        observed = {item["reference"]: item["digest"] for item in manifest["observations"]}
+        for record in manifest["records"]:
+            registries = (("rehearsal", "quay.io/anmrasto"),) if manifest.get("rehearsal") else (("quay", "quay.io/noiro"), ("docker", "noiro"))
+            for key, registry in registries:
+                rows = record.get(key, [])
+                if (len(rows) != 1 or rows[0].get("tag") != tag
+                        or observed.get(f"{registry}/{record['name']}:{tag}") != "sha256:" + rows[0].get("sha", "")):
+                    raise EvidenceError("refresh image is not bound to its exact alias observation")
+    if "image_selection_base" in manifest and manifest["image_selection_base"] is not None and not re.fullmatch(r"[0-9a-f]{64}", str(manifest["image_selection_base"])):
+        raise EvidenceError("invalid captured image selection")
+    if manifest.get("package_only") and (manifest["kind"] != "package" or directory != "r" or manifest["records"]
+            or not re.fullmatch(re.escape(release) + r"\.post[1-9][0-9]*", manifest["package_artifact"]["version"])):
+        raise EvidenceError("invalid package-only post update")
     if manifest.get("released", False) and (manifest["kind"] != "package" or directory != "r"):
         raise EvidenceError("only release package bundles may mark a stream released")
     prefix = f"docs/release_artifacts/{release}/{directory}/"
@@ -634,8 +876,10 @@ def validate_bundle(root):
             for base in record.get(base_key, []):
                 if "docs/" + base["cve"] not in files:
                     raise EvidenceError("base record references absent evidence")
-        for registry in ("quay", "docker"):
-            for image in record[registry]:
+        if record.get("rehearsal") and not manifest.get("rehearsal"):
+            raise EvidenceError("private image references require an explicit rehearsal identity")
+        for registry in ("quay", "docker", "rehearsal"):
+            for image in record.get(registry, []):
                 valid_name(image["tag"], "image tag")
                 if not re.fullmatch(r"[0-9a-f]{64}", image["sha"]):
                     raise EvidenceError("invalid image digest")
@@ -708,8 +952,12 @@ def validate_expected_scope(args, manifest, files):
     names = {record["name"] for record in manifest["records"] + manifest.get("failed_records", [])}
     if not names.issubset(allowed):
         raise EvidenceError("bundle contains another component's images")
-    if manifest["kind"] == "package" and manifest["directory"] != "z" and (not allowed or names != allowed):
+    cohort = set(manifest.get("existing_images", {}).get("names", [])) if manifest.get("package_only") else names
+    if manifest["kind"] in ("package", "image-refresh") and manifest["directory"] != "z" and (not allowed or cohort != allowed):
         raise EvidenceError("release package requires the complete promoted image cohort")
+    if manifest["kind"] == "image-refresh" and not manifest.get("rehearsal"):
+        if not args.expected_tag_object or manifest["run"].get("tag_object") != args.expected_tag_object:
+            raise EvidenceError("refresh tag object differs from trusted publisher scope")
     owners = names | ({"acc-provision"} if manifest["kind"] == "package" else set())
     for path in files:
         if PurePosixPath(path).parts[4] not in owners:
@@ -752,7 +1000,8 @@ def merge_status(data, manifest):
     if release is None:
         release = {"release_tag": manifest["release_tag"], "release_streams": []}
         data["releases"].append(release)
-    for name in (manifest["release_tag"] + ".z", manifest["release_tag"], manifest["stream"]):
+    targets = (manifest["stream"],) if manifest["kind"] == "image-refresh" or manifest.get("package_only") else (manifest["release_tag"] + ".z", manifest["release_tag"], manifest["stream"])
+    for name in targets:
         if not any(item.get("release_name") == name for item in release["release_streams"]):
             stream = {"release_name": name, "last_updated": manifest["prepared_at"],
                       "container_images": [], "acc_provision": []}
@@ -786,16 +1035,17 @@ def merge_status(data, manifest):
             for field in ("cve_error", "severity_link"):
                 old.pop(field, None)
             old.update(incoming)
-    if manifest["kind"] == "package":
+    if manifest["kind"] in ("package", "image-refresh"):
         if manifest["records"]:
             # A release/RC promotion selects a complete z cohort. Components
             # removed from that cohort must not survive from an older release.
             names = [record["name"] for record in manifest["records"]]
             stream["container_images"] = [next(item for item in stream["container_images"] if item["name"] == name)
                                            for name in names]
-        stream["acc_provision"] = copy.deepcopy(manifest["package"])
-        if manifest.get("released"):
-            stream["released"] = True
+        if manifest["kind"] == "package":
+            stream["acc_provision"] = copy.deepcopy(manifest["package"])
+            if manifest.get("released") and not manifest.get("package_only"):
+                stream["released"] = True
     after = copy.deepcopy(stream)
     after.pop("last_updated", None)
     if after != before:
@@ -819,10 +1069,13 @@ def safe_destination(checkout, relative):
 def publish(args):
     # Full validation precedes even clone; failed bundles cannot write Git state.
     manifest, files = validate_bundle(args.bundle)
+    if rehearsal_context() and not manifest.get("rehearsal"):
+        raise EvidenceError("rehearsal publication requires explicit branch/SHA test evidence")
     validate_expected_scope(args, manifest, files)
-    if manifest["kind"] == "package":
-        validate_package_receipt(manifest, args.receipt)
+    receipt = validate_package_receipt(manifest, args.receipt) if manifest["kind"] == "package" else None
     repository = args.repository
+    if manifest.get("rehearsal") and (repository != "https://github.com/noironetworks/test-cicd-status.git" or args.branch != "anmrasto/gha-rehearsal-" + manifest["release_tag"]):
+        raise EvidenceError("rehearsal publication must use the fixed test status target")
     if repository.startswith("https://"):
         if not re.fullmatch(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?", repository):
             raise EvidenceError("status remote must be an approved GitHub HTTPS repository")
@@ -871,6 +1124,7 @@ def publish(args):
             if stale:
                 print("A newer producer run already published these components")
                 return
+            guard_current_state(checkout, previous, manifest, receipt, identity_index)
             updated = merge_status(copy.deepcopy(previous), manifest)
             if updated != previous:
                 status.write_text(yaml.safe_dump(updated, sort_keys=False), encoding="utf-8")
@@ -934,6 +1188,8 @@ def validate_package_receipt(manifest, path):
         if not re.fullmatch(r"[0-9a-f]{64}", receipt.get("input_lock_sha256", "")):
             raise EvidenceError("production receipt is missing approved input lock identity")
 
+    return receipt
+
 
 def validate_package_link(value, version, index):
     host = "pypi.org" if index == "pypi" else "test.pypi.org"
@@ -945,20 +1201,29 @@ def validate_package_link(value, version, index):
 def parser():
     root = argparse.ArgumentParser(description=__doc__)
     sub = root.add_subparsers(dest="command", required=True)
-    for command in ("prepare-images", "prepare-package"):
+    for command in ("prepare-images", "prepare-package", "prepare-image-refresh"):
         child = sub.add_parser(command)
         child.add_argument("--bundle", required=True)
         child.add_argument("--run-number", default=os.environ.get("GITHUB_RUN_NUMBER") or os.environ.get("TRAVIS_BUILD_NUMBER"))
         child.add_argument("--run-attempt", default=os.environ.get("GITHUB_RUN_ATTEMPT", "1"))
+        child.add_argument("--source-ref")
         for flag, env in (("release-tag", "RELEASE_TAG"), ("source-repository", "TRAVIS_REPO_SLUG"),
                           ("source-sha", "TRAVIS_COMMIT"), ("run-id", "TRAVIS_BUILD_NUMBER"),
                           ("run-url", "TRAVIS_JOB_WEB_URL"), ("trigger-tag", "TRAVIS_TAG"),
                           ("upstream-id", "UPSTREAM_ID")):
-            child.add_argument("--" + flag, default=os.environ.get(env), required=not bool(os.environ.get(env)))
+            default = None if flag == "trigger-tag" and os.environ.get("CI_REHEARSAL") == "1" else os.environ.get(env)
+            child.add_argument("--" + flag, default=default, required=flag != "trigger-tag" and not bool(default))
         if command == "prepare-images":
             child.add_argument("--metadata", required=True)
             child.add_argument("--expected-images", help="require this exact cohort after a successful build")
             child.set_defaults(func=prepare_images)
+        elif command == "prepare-image-refresh":
+            child.add_argument("--mode", choices=("release", "rc"), required=True)
+            child.add_argument("--rc-number")
+            child.add_argument("--status-checkout", required=True)
+            child.add_argument("--expected-images", required=True)
+            child.add_argument("--tag-object")
+            child.set_defaults(func=prepare_image_refresh)
         else:
             child.add_argument("--artifact", required=True)
             child.add_argument("--mode", choices=("z", "release", "rc"), required=True)
@@ -976,7 +1241,15 @@ def parser():
     for flag in ("release-tag", "kind", "stream", "source-repository", "source-sha", "cicd-sha", "run-id", "images"):
         child.add_argument("--expected-" + flag, required=True)
     child.add_argument("--expected-run-attempt")
+    child.add_argument("--expected-tag-object")
     child.set_defaults(func=publish)
+    child = sub.add_parser("package-status-route")
+    for flag in ("status-checkout", "release-tag", "index", "version", "output"):
+        child.add_argument("--" + flag, required=True)
+    child.add_argument("--mode", choices=("z", "release", "rc"), required=True)
+    child.add_argument("--rc-number")
+    child.add_argument("--receipt")
+    child.set_defaults(func=package_status_route)
     return root
 
 

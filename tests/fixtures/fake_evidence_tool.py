@@ -52,7 +52,9 @@ elif sys.argv[1:3] == ["image", "inspect"]:
         pulled = Path(os.environ["PULLED_REFS_FILE"])
         if not pulled.exists() or reference not in json.loads(pulled.read_text()):
             sys.exit("base was not pulled before inspection")
-    if any("{{.Id}}" in argument for argument in sys.argv):
+    if any("quay.expires-after" in argument for argument in sys.argv):
+        print(os.environ.get("FAKE_EXPIRY_LABEL", "<no value>"))
+    elif any("{{.Id}}" in argument for argument in sys.argv):
         image = reference.rsplit("/", 1)[-1].split(":")[0]
         value = hashlib.sha256(image.encode()).hexdigest() if os.environ.get("DYNAMIC_IMAGE_IDS") else os.environ.get("FAKE_IMAGE_ID", "e" * 64)
         if os.environ.get("MISMATCH_IMAGE_ID_REF") == reference:

@@ -190,5 +190,41 @@ class CreateReleaseLockIntegration(unittest.TestCase):
         lock = self.cli()
         self.assertTrue(lock['images']['opflex']['registries']['quay.io/noiro']['reference'].endswith('.111226.127'))
 
+    def test_independent_cli_and_packager_reuse_approved_producer_helper_revisions(self):
+        output = self.dir / 'independent-lock.json'
+        args = [sys.executable, str(SCRIPT), '--release-tag', TAG + '.post1', '--source-branch', 'master',
+                '--cicd-commit', 'd' * 40, '--cli-source-sha', 'c' * 40,
+                '--versions-file', str(self.versions), '--output', str(output), '--dependency', self.base]
+        for bundle in (self.aci, self.opflex): args += ['--bundle', str(bundle)]
+        result = subprocess.run(args, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lock = json.loads(output.read_text())
+        self.assertEqual(lock['release_tag'], TAG + '.post1')
+        self.assertEqual(lock['cicd_commit'], 'd' * 40)
+        self.assertEqual(lock['cli_source_sha'], 'c' * 40)
+        self.assertEqual(lock['sources']['noironetworks/aci-containers'], 'b' * 40)
+        self.assertTrue(all(item['producer']['cicd_commit'] == self.cicd for item in lock['images'].values()))
+        self.assertNotEqual(lock['cicd_commit'], lock['images']['opflex']['producer']['cicd_commit'])
+        self.assertNotEqual(lock['cli_source_sha'], lock['sources']['noironetworks/aci-containers'])
+        expected = {item['reference']: item['digest'] for entry in lock['images'].values() for item in entry['registries'].values()}
+        expected.update({item['reference']: item['digest'] for item in lock['dependencies']})
+        release_policy.validate_input_lock(lock, TAG + '.post1', {'schema_version': 1, 'digests': expected,
+            'platforms': {ref: 'linux/amd64' for ref in expected}})
+        policy = {'repository': 'noironetworks/acc-provision', 'source_branches': ['master'], 'required_tests': [
+            {'repository': 'noironetworks/aci-containers', 'workflow': 'test.yml', 'jobs': ['test']}]}
+        self.assertEqual(release_policy.check_requirements(policy, lock, 'e' * 40)[0]['source_sha'], 'c' * 40)
+
+    def test_rc_consumer_pins_reuse_base_producer_but_raw_lock_tag_stays_rc(self):
+        self.write_versions(overrides={field: TAG + '.' + UPSTREAM + '.rc2' for field in FIELDS.values()})
+        output = self.dir / 'rc-lock.json'
+        args = [sys.executable, str(SCRIPT), '--release-tag', TAG + 'rc2', '--source-branch', 'master',
+                '--cicd-commit', self.cicd, '--cli-source-sha', 'c' * 40,
+                '--versions-file', str(self.versions), '--output', str(output), '--dependency', self.base]
+        for bundle in (self.aci, self.opflex): args += ['--bundle', str(bundle)]
+        result = subprocess.run(args, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lock = json.loads(output.read_text())
+        self.assertEqual(lock['release_tag'], TAG + 'rc2')
+        self.assertTrue(all(item['reference'].endswith('.rc2') for entry in lock['images'].values() for item in entry['registries'].values()))
 
 if __name__ == '__main__': unittest.main()

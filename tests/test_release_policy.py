@@ -483,7 +483,10 @@ class ReleasePolicyIntegration(unittest.TestCase):
             write_json(index.state, record)
             with self.subTest(kind=kind), mock.patch.dict(policy.INDEXES, {'testpypi': (index.url, index.url + '/legacy/')}), \
                  mock.patch.object(policy, 'command', side_effect=lambda argv, **kw: original_command(argv, **kw) if Path(argv[0]).name == 'git' else (_ for _ in ()).throw(AssertionError('must not upload conflicting bytes'))):
-                with self.assertRaises(policy.PolicyError): policy.upload(self.manifest_path, self.dir / 'receipt.json')
+                receipt = self.dir / 'receipt.json'
+                result = policy.main(['upload', '--manifest', str(self.manifest_path), '--receipt', str(receipt)])
+                self.assertEqual(result, 3 if kind == 'hash' else 1)
+                self.assertFalse(receipt.exists())
 
     def test_lost_upload_ack_reconciles_exact_bytes_and_child_gets_only_selected_credentials(self):
         manifest = self.preview_manifest(); index = self.with_index()
@@ -634,6 +637,27 @@ raise SystemExit(23)
             with self.assertRaises(policy.PolicyError):
                 policy.upload(self.manifest_path, self.dir / 'wrong-lock-receipt.json', authorization_path,
                               self.repo, self.artifact, self.policy_path, self.public_key)
+
+    def test_verify_tag_cli_retains_authority_after_source_branch_advances_and_rejects_move(self):
+        self.sign()
+        captured = self.git('rev-parse', 'refs/tags/' + TAG)
+        (self.repo / 'README').write_text('Later unrelated source change')
+        self.git('add', '.'); self.git('commit', '-m', 'advance branch')
+        output = self.dir / 'verified-tag.json'
+        self.cli('verify-tag', '--repo', self.repo, '--tag', TAG, '--policy', self.policy_path,
+                 '--public-key', self.public_key, '--expected-source-sha', self.source,
+                 '--expected-tag-object', captured, '--output', output)
+        self.assertEqual(json.loads(output.read_text())['source_sha'], self.source)
+        self.sign(force=True)
+        self.cli('verify-tag', '--repo', self.repo, '--tag', TAG, '--policy', self.policy_path,
+                 '--public-key', self.public_key, '--expected-tag-object', captured, '--output', output, success=False)
+
+    def test_signed_rc_and_post_tag_grammar_is_narrow(self):
+        for tag in (TAG + 'rc2', TAG + '.post1'):
+            self.git('tag', '-s', '-u', self.authorized + '!', tag, '-m', 'Release to pypi.org')
+            self.assertEqual(policy.verify_tag(self.repo, tag, self.policy, self.public_key)['tag'], tag)
+        for tag in (TAG + 'rc0', TAG + '.post0', TAG + '.post01', TAG + 'post1', TAG + 'rc2.post1'):
+            with self.assertRaises(policy.PolicyError): policy.tag_identity(self.repo, tag)
 
 if __name__ == '__main__':
     unittest.main()

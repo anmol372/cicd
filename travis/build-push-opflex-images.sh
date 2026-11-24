@@ -5,7 +5,8 @@ else
   set -x
 fi
 SCRIPTS_DIR=$(dirname ${BASH_SOURCE[0]})
-source "$SCRIPTS_DIR/globals.sh"
+source "$SCRIPTS_DIR/globals.sh" || exit 1
+export -n CI_QUAY_USERNAME CI_QUAY_TOKEN
 
 git show --summary
 
@@ -15,25 +16,24 @@ OTHER_IMAGE_TAGS="${TRAVIS_TAG_WITH_UPSTREAM_ID},${TRAVIS_TAG_WITH_UPSTREAM_ID_D
 RELEASE_TAG_WITH_UPSTREAM_ID=${RELEASE_TAG}.${UPSTREAM_ID}
 
 if [[ "${GITHUB_ACTIONS:-false}" == "true" ]]; then
-  : "${GHA_TRIGGER_TAG:?GHA_TRIGGER_TAG is required for a GitHub Actions build}"
   : "${GHA_DATE_TAG:?GHA_DATE_TAG is required for a GitHub Actions build}"
   : "${GHA_OPFLEX_BUILD_PHASE:?GHA_OPFLEX_BUILD_PHASE is required for a GitHub Actions build}"
   : "${TRAVIS_BUILD_NUMBER:?TRAVIS_BUILD_NUMBER is required for a GitHub Actions build}"
   : "${CI_ARTIFACT_DIR:?CI_ARTIFACT_DIR is required for a GitHub Actions build}"
 
-  # Validate the release form (prefix match) like Travis check-git-tag.sh, not an exact tag.
-  [[ "${GHA_TRIGGER_TAG}" == "${RELEASE_TAG}"* ]] || {
-    echo "GitHub Actions trigger tag ${GHA_TRIGGER_TAG} must match release ${RELEASE_TAG}" >&2
-    exit 1
-  }
-  [[ "${GITHUB_REPOSITORY:-}" == "noironetworks/opflex" ]] || {
-    echo "GitHub Actions build is restricted to noironetworks/opflex" >&2
-    exit 1
-  }
-  [[ "${GITHUB_REF:-}" == "refs/tags/${GHA_TRIGGER_TAG}" ]] || {
-    echo "GitHub Actions build is restricted to tag ${GHA_TRIGGER_TAG}" >&2
-    exit 1
-  }
+  if [[ "${CI_REHEARSAL:-}" == 1 ]]; then
+    [[ "${GITHUB_REPOSITORY}" == anmol372/opflex ]] || exit 1
+  else
+    : "${GHA_TRIGGER_TAG:?GHA_TRIGGER_TAG is required for a GitHub Actions build}"
+    [[ "${GITHUB_REPOSITORY:-}" == noironetworks/opflex &&
+       "${GITHUB_REF:-}" == "refs/tags/${GHA_TRIGGER_TAG}" ]] || {
+      echo "GitHub Actions build requires a tag in noironetworks/opflex" >&2; exit 1;
+    }
+    case "${GHA_OPFLEX_BUILD_PHASE}:${GHA_TRIGGER_TAG}" in
+      "base:${RELEASE_TAG}-opflex-build-base"|"runtime:${RELEASE_TAG}") ;;
+      *) echo "Tag does not select the requested OpFlex build phase" >&2; exit 1 ;;
+    esac
+  fi
   [[ "${TRAVIS_TAG:-}" == "${RELEASE_TAG}" ]] || {
     echo "GitHub Actions must use release tag ${RELEASE_TAG} for image naming" >&2
     exit 1
@@ -104,7 +104,11 @@ if [[ "${GITHUB_ACTIONS:-false}" == "true" && "${CI_EVIDENCE_MODE:-}" == "prepar
   done
 fi
 
-docker/travis/build-opflex-travis.sh "${IMAGE_BUILD_REGISTRY}" "${IMAGE_BUILD_TAG}"
+BUILD_LABEL=
+if [[ "${CI_REHEARSAL:-}" == 1 ]]; then
+  BUILD_LABEL=--label=quay.expires-after=6h
+fi
+docker/travis/build-opflex-travis.sh "${IMAGE_BUILD_REGISTRY}" "${IMAGE_BUILD_TAG}" "${BUILD_LABEL}"
 docker images
 
 #Fetching Base Image - Common base image for every container so fetching once
@@ -116,30 +120,16 @@ docker images
 if [[ "${BUILD_BASE}" == true ]]; then
   ALL_IMAGES=("opflex-build-base")
   for IMAGE in "${ALL_IMAGES[@]}"; do
-    "$SCRIPTS_DIR/push-images.sh" "${IMAGE_BUILD_REGISTRY}" "${IMAGE}" "${IMAGE_BUILD_TAG}" "${OTHER_IMAGE_TAGS}" "${BASE_IMAGE}"
+    CI_QUAY_USERNAME="${CI_QUAY_USERNAME:-}" CI_QUAY_TOKEN="${CI_QUAY_TOKEN:-}" \
+      "$SCRIPTS_DIR/push-images.sh" "${IMAGE_BUILD_REGISTRY}" "${IMAGE}" "${IMAGE_BUILD_TAG}" "${OTHER_IMAGE_TAGS}" "${BASE_IMAGE}"
   done
 else
-  if [[ "${GITHUB_ACTIONS:-false}" == "true" ]]; then
-    : "${EXPECTED_OPFLEX_BASE_DIGEST:?EXPECTED_OPFLEX_BASE_DIGEST is required for runtime phase validation}"
-    # Validate the base image digest before building on top of it
-    # Pull the image to ensure it's available locally
-    docker pull "${IMAGE_BUILD_REGISTRY}/opflex-build-base:${IMAGE_BUILD_TAG}"
-    actual_digest=$(docker image inspect --format='{{range .RepoDigests}}{{println .}}{{end}}' \
-      "${IMAGE_BUILD_REGISTRY}/opflex-build-base:${IMAGE_BUILD_TAG}" \
-      | sed -n "s|^${IMAGE_BUILD_REGISTRY}/opflex-build-base@||p")
-    [[ "${actual_digest}" =~ ^sha256:[0-9a-f]{64}$ ]] || {
-      echo "::error::Cannot resolve opflex-build-base digest" >&2
-      exit 1
-    }
-    [[ "${actual_digest}" == "${EXPECTED_OPFLEX_BASE_DIGEST}" ]] || {
-      echo "::error::Base image digest mismatch: expected ${EXPECTED_OPFLEX_BASE_DIGEST}, got ${actual_digest}" >&2
-      exit 1
-    }
-  fi
-
+  # The child checked and used the selected digest before it built. The alias can
+  # change after that check without changing the runtime's actual build input.
   ALL_IMAGES=("opflex-build" "opflex")
   for IMAGE in "${ALL_IMAGES[@]}"; do
-    "$SCRIPTS_DIR/push-images.sh" "${IMAGE_BUILD_REGISTRY}" "${IMAGE}" "${IMAGE_BUILD_TAG}" "${OTHER_IMAGE_TAGS}" "${BASE_IMAGE}"
+    CI_QUAY_USERNAME="${CI_QUAY_USERNAME:-}" CI_QUAY_TOKEN="${CI_QUAY_TOKEN:-}" \
+      "$SCRIPTS_DIR/push-images.sh" "${IMAGE_BUILD_REGISTRY}" "${IMAGE}" "${IMAGE_BUILD_TAG}" "${OTHER_IMAGE_TAGS}" "${BASE_IMAGE}"
   done
 
   IMAGE_SHA=$(docker image inspect --format='{{.Id}}' "${IMAGE_BUILD_REGISTRY}/opflex:${IMAGE_BUILD_TAG}")

@@ -13,14 +13,20 @@ OTHER_IMAGE_TAGS=${4//,/ }
 BASE_IMAGE=$5
 if [[ "${GITHUB_ACTIONS:-false}" == "true" && "${CI_EVIDENCE_MODE:-}" == "prepared-v1" ]]; then
   : "${CI_ARTIFACT_DIR:?CI_ARTIFACT_DIR is required}"
-  : "${QUAY_NOIRO_DOCKER_CONFIG:?QUAY_NOIRO_DOCKER_CONFIG is required}"
+  if [[ "${CI_REHEARSAL:-}" != 1 ]]; then
+    : "${QUAY_NOIRO_DOCKER_CONFIG:?QUAY_NOIRO_DOCKER_CONFIG is required}"
+  fi
   unset TRAVIS_TAGGER GITHUB_TOKEN GH_TOKEN PYPI_PASS TEST_PYPI_PASS
   exec python3 "$SCRIPTS_DIR/image_publication.py" \
     --artifacts "${CI_ARTIFACT_DIR}" --registry "${IMAGE_BUILD_REGISTRY}" \
     --image "${IMAGE}" --tag "${IMAGE_BUILD_TAG}" --other-tags "${OTHER_IMAGE_TAGS}" \
     --base-image "${BASE_IMAGE}" --z-tag "${IMAGE_Z_TAG}" \
     --dated-tag "${TRAVIS_TAG_WITH_UPSTREAM_ID_DATE_TRAVIS_BUILD_NUMBER}" \
-    --quay-config "${QUAY_NOIRO_DOCKER_CONFIG}"
+    --quay-config "${QUAY_NOIRO_DOCKER_CONFIG:-}"
+fi
+if [[ "${CI_REHEARSAL:-}" == 1 ]]; then
+  echo "Rehearsal requires the prepared image publisher" >&2
+  exit 1
 fi
 BUILT_IMAGE=${IMAGE_BUILD_REGISTRY}/${IMAGE}:${IMAGE_BUILD_TAG}
 OTHER_IMAGE_TAGS="${OTHER_IMAGE_TAGS} ${IMAGE_Z_TAG}"

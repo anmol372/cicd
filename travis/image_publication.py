@@ -9,6 +9,7 @@ import subprocess
 import sys
 
 from scan_result import collect, environment, execute, stamp, DIGEST
+import rehearsal_quay
 
 ACI_IMAGES = {"aci-containers-host", "aci-containers-host-ovscni", "aci-containers-controller", "cnideploy",
               "aci-containers-operator", "openvswitch", "aci-containers-webhook", "aci-containers-certmanager"}
@@ -23,11 +24,30 @@ def write(path, value):
 
 def publish(args):
     directory = Path(args.artifacts)
+    receipt_path = directory / "publication" / (args.image + ".json")
+    built = f"{args.registry}/{args.image}:{args.tag}"
+    rehearsal = rehearsal_quay.active()
+    expected_built_registry = rehearsal_quay.REGISTRY if rehearsal else "quay.io/noirolabs"
+    if args.registry != expected_built_registry:
+        raise ValueError("image build registry does not match the workflow destination")
     policy = os.environ.get("CI_SCAN_POLICY", "fatal")
     if policy not in ("fatal", "advisory"):
-        write(directory / "publication" / (args.image + ".json"), {
+        write(receipt_path, {
             "schema_version": 1, "image": args.image, "state": "failed", "attempts": [],
             "critical_failure": "unknown-scan-policy", "scan_policy": policy, "finished_at": stamp()})
+        return 1
+    try:
+        ttl_label = execute(["docker", "image", "inspect", "--format",
+                             '{{index .Config.Labels "quay.expires-after"}}', built],
+                            timeout=args.timeout).strip()
+        if rehearsal and ttl_label != "6h":
+            raise ValueError("rehearsal image needs the six-hour expiry label")
+        if not rehearsal and ttl_label not in ("", "<no value>"):
+            raise ValueError("unexpected expiry label")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        write(receipt_path, {"schema_version": 1, "image": args.image, "state": "failed",
+                             "attempts": [], "references": [],
+                             "critical_failure": "invalid-test-expiration-label", "finished_at": stamp()})
         return 1
     report_dir = directory / "reports" / args.image
     base = directory / "base-provenance" / (args.image + ".json")
@@ -58,7 +78,7 @@ def publish(args):
             if (captured.get("state") != "ok" or captured.get("role") != "opflex-build-base"
                     or captured.get("captured_before_build") is not True or captured.get("immutable") is not True
                     or not DIGEST.fullmatch(expected) or not DIGEST.fullmatch(captured.get("image_id", ""))
-                    or reference != "quay.io/noirolabs/opflex-build-base@" + expected):
+                    or reference != f"{expected_built_registry}/opflex-build-base@" + expected):
                 raise ValueError("ACI iptables input was not immutably verified before extraction")
             build_inputs.append({key: captured[key] for key in
                                  ("role", "reference", "digest", "image_id", "captured_before_build", "immutable")})
@@ -67,9 +87,7 @@ def publish(args):
     receipt = {"schema_version": 1, "image": args.image, "image_id": scan_data.get("image_id"),
                "state": "in-progress", "attempts": [], "references": [], "alias_policy": "aliases-last",
                "started_at": stamp(), "critical_failure": None, "scan_policy": policy}
-    receipt_path = directory / "publication" / (args.image + ".json")
     write(receipt_path, receipt)
-    built = f"{args.registry}/{args.image}:{args.tag}"
     expected_id = scan_data.get("image_id")
     other_tags = list(dict.fromkeys(tag for tag in re.split(r"[, ]+", args.other_tags) if tag and tag != args.z_tag))
 
@@ -92,26 +110,62 @@ def publish(args):
             write(receipt_path, receipt)
 
     def push(reference, registry, config=None, tag_from=True, verify=True):
-        if tag_from:
-            command(["docker", "tag", built, reference], "tag", reference, config)
-        command(["docker", "push", reference], "push", reference, config)
+        repository = reference.rsplit(":", 1)[0]
+        existing = None
+        reused = False
+        if rehearsal:
+            try:
+                existing = rehearsal_quay.current_tag(reference)
+                if existing is not None:
+                    previous_digest = existing["manifest_digest"]
+                    if not DIGEST.fullmatch(previous_digest):
+                        raise ValueError("invalid active tag digest")
+                    previous = f"{repository}@{previous_digest}"
+                    command(["docker", "pull", previous], "inspect-active-tag", reference, config)
+                    reused = command(["docker", "image", "inspect", "--format", "{{.Id}}", previous],
+                                     "inspect-active-image-id", reference, config).strip() == expected_id
+            except (OSError, ValueError, KeyError, TypeError):
+                receipt.update(critical_failure="test-tag-metadata-unavailable", expiry_failed_tag=reference)
+                raise
+        if not reused:
+            if tag_from:
+                command(["docker", "tag", built, reference], "tag", reference, config)
+            output = command(["docker", "push", reference], "push", reference, config)
+        inspected_reference = reference
+        expiry = None
+        if rehearsal:
+            try:
+                digest = existing["manifest_digest"] if reused else re.findall(
+                    r"\bdigest:\s+(sha256:[a-f0-9]{64})\b", output)[-1]
+                if not DIGEST.fullmatch(digest):
+                    raise ValueError("invalid manifest digest")
+                expiry = rehearsal_quay.verify_expiry(reference, digest, created=not reused)
+            except (ValueError, IndexError, KeyError, TypeError):
+                receipt.update(critical_failure="test-tag-expiry-unverified", expiry_failed_tag=reference)
+                raise ValueError("test tag expiry could not be confirmed") from None
+            inspected_reference = reference.rsplit(":", 1)[0] + "@" + digest
         if verify:
-            command(["docker", "pull", reference], "verify-pull", reference, config)
-            raw = command(["docker", "image", "inspect", "--format", "{{json .RepoDigests}}", reference], "verify-digest", reference, config)
+            command(["docker", "pull", inspected_reference], "verify-pull", reference, config)
+            raw = command(["docker", "image", "inspect", "--format", "{{json .RepoDigests}}", inspected_reference], "verify-digest", reference, config)
             entries = json.loads(raw)
-            repository = reference.rsplit(":", 1)[0].removeprefix("docker.io/")
-            digest = next(value.split("@", 1)[1] for value in entries
-                          if value.split("@", 1)[0].removeprefix("docker.io/") == repository)
-            observed_id = command(["docker", "image", "inspect", "--format", "{{.Id}}", reference], "verify-image-id", reference, config).strip()
-            if not DIGEST.fullmatch(digest) or observed_id != expected_id:
+            repository = repository.removeprefix("docker.io/")
+            observed_digest = next(value.split("@", 1)[1] for value in entries
+                                   if value.split("@", 1)[0].removeprefix("docker.io/") == repository
+                                   and (not rehearsal or value.split("@", 1)[1] == digest))
+            observed_id = command(["docker", "image", "inspect", "--format", "{{.Id}}", inspected_reference], "verify-image-id", reference, config).strip()
+            if not DIGEST.fullmatch(observed_digest) or observed_id != expected_id:
                 receipt["attempts"][-1].update(state="error", reason="published-image-identity-mismatch",
                                                 expected_image_id=expected_id, observed_image_id=observed_id,
-                                                observed_digest=digest)
+                                                observed_digest=observed_digest)
                 write(receipt_path, receipt)
                 raise RuntimeError("published image identity verification failed")
-            receipt["references"].append({"registry": registry, "reference": reference,
-                                           "tag": reference.rsplit(":", 1)[1], "digest": digest,
-                                           "image_id": observed_id, "verified_at": stamp()})
+            result = {"registry": registry, "reference": reference,
+                      "tag": reference.rsplit(":", 1)[1], "digest": observed_digest,
+                      "image_id": observed_id, "verified_at": stamp()}
+            if rehearsal:
+                result["expires_at"] = expiry
+                result["reused"] = reused
+            receipt["references"].append(result)
             write(receipt_path, receipt)
 
     try:
@@ -120,6 +174,25 @@ def publish(args):
         if policy == "fatal" and any(scan_data.get(target, {}).get("state") != "ok" for target in ("image", "base", "sbom", "trivy")):
             receipt["critical_failure"] = "fatal-scan-policy-failed"
             raise RuntimeError("fatal scan policy rejected unavailable/failed evidence")
+        if rehearsal:
+            if build_input_error:
+                receipt["critical_failure"] = build_input_error
+                raise ValueError("rehearsal build input proof is missing")
+            stream = os.environ.get("CI_REHEARSAL_STREAM", "")
+            if stream not in ("z", "rc", "release"):
+                receipt["critical_failure"] = "invalid-rehearsal-stream"
+                raise ValueError("invalid rehearsal stream")
+            aliases = list(other_tags)
+            if stream == "rc" and args.image not in ("opflex-build-base", "opflex-build"):
+                rc_number = os.environ.get("CI_REHEARSAL_RC_NUMBER", "")
+                if not re.fullmatch(r"[1-9][0-9]*", rc_number):
+                    raise ValueError("rehearsal RC requires a positive number")
+                aliases.append(f"{args.tag}.rc{rc_number}")
+            aliases.append(args.z_tag)
+            for tag in dict.fromkeys([args.tag, *aliases]):
+                push(f"{args.registry}/{args.image}:{tag}", "rehearsal", tag_from=tag != args.tag)
+            receipt["state"] = "complete"
+            return 0
         push(built, "noirolabs", tag_from=False)
         for tag in other_tags:
             push(f"quay.io/noirolabs/{args.image}:{tag}", "noirolabs")
@@ -138,8 +211,9 @@ def publish(args):
         push(f"quay.io/noirolabs/{args.image}:{args.z_tag}", "noirolabs")
         receipt["state"] = "complete"
         return 0
-    except (RuntimeError, ValueError, KeyError, TypeError, StopIteration):
-        receipt["state"] = "partial" if receipt["references"] else "failed"
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, StopIteration):
+        pushed = any(item["phase"] == "push" for item in receipt["attempts"])
+        receipt["state"] = "partial" if receipt["references"] or (rehearsal and pushed) else "failed"
         receipt["critical_failure"] = receipt.get("critical_failure") or "image-publication-failed"
         return 1
     finally:
@@ -147,7 +221,7 @@ def publish(args):
         write(receipt_path, receipt)
         # A failed image still has publishable scan and publication evidence.
         if args.image not in ("opflex-build", "opflex-build-base"):
-            row = {"registry": "quay.io/noiro", "image": args.image, "tag": args.tag,
+            row = {"registry": args.registry if rehearsal else "quay.io/noiro", "image": args.image, "tag": args.tag,
                    "other_tags": other_tags, "sha": expected_id,
                    "base_image": scan_data.get("base", {}).get("provenance", {}).get("reference", args.base_image),
                    "image_z_tag": args.z_tag, "dated_tag": args.dated_tag,

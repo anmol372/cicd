@@ -1,0 +1,179 @@
+{
+  "cicd": {
+    "sha": "<helper-sha>"
+  },
+  "directory": "r",
+  "failed_records": [],
+  "files": [
+    {
+      "path": "docs/release_artifacts/6.1.1.8/r/acc-provision/6.1.1.8-buildlog.txt",
+      "sha256": "e7ea8b0acd91ee36d3ac4e0eb986d221cc35bb176025d50bc47ecff14dbf1ac8",
+      "size": 126
+    },
+    {
+      "path": "docs/release_artifacts/6.1.1.8/r/image-0/6.1.1.8-buildlog.txt",
+      "sha256": "e7ea8b0acd91ee36d3ac4e0eb986d221cc35bb176025d50bc47ecff14dbf1ac8",
+      "size": 126
+    },
+    {
+      "path": "docs/release_artifacts/6.1.1.8/r/image-0/6.1.1.8-cve-base.txt",
+      "sha256": "2e8aab986a7c13e2dd7ba8fd7435b152e3ff92f426f0df8e49ee31c5ab5f2b4b",
+      "size": 55
+    },
+    {
+      "path": "docs/release_artifacts/6.1.1.8/r/image-0/6.1.1.8-cve.txt",
+      "sha256": "5fc86b0d06bffbfdb1523e9bdb1969757aa8017aa098d758feedf01c26e5bd46",
+      "size": 50
+    },
+    {
+      "path": "docs/release_artifacts/6.1.1.8/r/image-0/6.1.1.8-sbom.txt",
+      "sha256": "5dfd8f4ae4dd29adae57faab5d385b76d9ea700dcab4f51e97d0bca65a7327ad",
+      "size": 51
+    },
+    {
+      "path": "docs/release_artifacts/6.1.1.8/r/image-0/scans/123-1/cve-base.txt",
+      "sha256": "2e8aab986a7c13e2dd7ba8fd7435b152e3ff92f426f0df8e49ee31c5ab5f2b4b",
+      "size": 55
+    },
+    {
+      "path": "docs/release_artifacts/6.1.1.8/r/image-0/scans/123-1/cve.txt",
+      "sha256": "5fc86b0d06bffbfdb1523e9bdb1969757aa8017aa098d758feedf01c26e5bd46",
+      "size": 50
+    },
+    {
+      "path": "docs/release_artifacts/6.1.1.8/r/image-0/6.1.1.8-cve-base-original.txt",
+      "sha256": "2e8aab986a7c13e2dd7ba8fd7435b152e3ff92f426f0df8e49ee31c5ab5f2b4b",
+      "size": 55
+    }
+  ],
+  "images": [],
+  "kind": "package",
+  "observations": [
+    {
+      "digest": "sha256:1772edb5bff23c6707879a09b1647757941ad58ff326a55699b53c4b504b3231",
+      "reference": "quay.io/noiro/image-0:6.1.1.8.42"
+    },
+    {
+      "digest": "sha256:d0b1a509d08f32a6e96684ddda112e6a565a6cecb86845e8776c334ade3eeb0f",
+      "reference": "noiro/image-0:6.1.1.8.42"
+    }
+  ],
+  "package": [
+    {
+      "build-logs": "release_artifacts/6.1.1.8/r/acc-provision/6.1.1.8-buildlog.txt",
+      "build-time": "<timestamp>",
+      "commit": [
+        {
+          "link": "https://github.com/noironetworks/aci-containers/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "link": "https://pypi.org/project/acc-provision/6.1.1.8/#files",
+      "tag": "6.1.1.8"
+    }
+  ],
+  "package_artifact": {
+    "filename": "package.tar.gz",
+    "index": "pypi",
+    "name": "acc-provision",
+    "sha256": "719e5ba326cc1d7f493309c9e2eb09fed7ce356554168d73f30347e113340d94",
+    "size": 31,
+    "version": "6.1.1.8"
+  },
+  "prepared_at": "<timestamp>",
+  "records": [
+    {
+      "base-image": [
+        {
+          "cve": "release_artifacts/6.1.1.8/r/image-0/6.1.1.8-cve-base.txt",
+          "severity": [
+            {
+              "C": 0,
+              "H": 1,
+              "L": 0,
+              "M": 0,
+              "U": 0
+            }
+          ],
+          "sha": "19a0a084b9b98c04a22f4cac4a949148eb595a0350ba65e52e51eac3fb8b2c7c"
+        }
+      ],
+      "base-image-original": [
+        {
+          "cve": "release_artifacts/6.1.1.8/r/image-0/6.1.1.8-cve-base-original.txt",
+          "date-and-time": "<timestamp>",
+          "severity": [
+            {
+              "C": 0,
+              "H": 1,
+              "L": 0,
+              "M": 0,
+              "U": 0
+            }
+          ],
+          "severity_type": "grype",
+          "sha": "19a0a084b9b98c04a22f4cac4a949148eb595a0350ba65e52e51eac3fb8b2c7c"
+        }
+      ],
+      "build-logs": "release_artifacts/6.1.1.8/r/image-0/6.1.1.8-buildlog.txt",
+      "build-time": "<timestamp>",
+      "commit": [
+        {
+          "link": "https://github.com/noironetworks/aci-containers/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "cve": "release_artifacts/6.1.1.8/r/image-0/6.1.1.8-cve.txt",
+      "docker": [
+        {
+          "link": "https://hub.docker.com/layers/noiro/image-0/6.1.1.8.42/images/sha256-d0b1a509d08f32a6e96684ddda112e6a565a6cecb86845e8776c334ade3eeb0f?context=explore",
+          "sha": "d0b1a509d08f32a6e96684ddda112e6a565a6cecb86845e8776c334ade3eeb0f",
+          "tag": "6.1.1.8.42"
+        }
+      ],
+      "name": "image-0",
+      "quay": [
+        {
+          "link": "https://quay.io/noiro/image-0:6.1.1.8.42",
+          "sha": "1772edb5bff23c6707879a09b1647757941ad58ff326a55699b53c4b504b3231",
+          "tag": "6.1.1.8.42"
+        }
+      ],
+      "sbom": "release_artifacts/6.1.1.8/r/image-0/6.1.1.8-sbom.txt",
+      "severity": [
+        {
+          "C": 0,
+          "H": 1,
+          "L": 0,
+          "M": 0,
+          "U": 0
+        }
+      ],
+      "severity_type": "grype",
+      "update-release-cves-until": "<timestamp>"
+    }
+  ],
+  "release_tag": "6.1.1.8",
+  "released": true,
+  "retained_files": [
+    {
+      "path": "retained/package.tar.gz",
+      "sha256": "719e5ba326cc1d7f493309c9e2eb09fed7ce356554168d73f30347e113340d94",
+      "size": 31
+    }
+  ],
+  "run": {
+    "attempt": "1",
+    "id": "123",
+    "number": "123",
+    "trigger_tag": "6.1.1.8",
+    "upstream_id": "42",
+    "url": "https://example.test/run/123"
+  },
+  "schema_version": 1,
+  "source": {
+    "repository": "noironetworks/aci-containers",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "stream": "6.1.1.8"
+}
